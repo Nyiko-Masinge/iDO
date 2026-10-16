@@ -73,6 +73,12 @@ class ApprovalDecision(BaseModel):
     decision: str
     comment: str = ""
 
+class ResultFeedback(BaseModel):
+    verdict: str
+    corrected_left_index: int | None = Field(default=None, ge=0)
+    corrected_right_index: int | None = Field(default=None, ge=0)
+    comment: str = Field(default="", max_length=1000)
+
 class WorkflowInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     description: str = Field(default="", max_length=500)
@@ -295,9 +301,61 @@ def run_results(run_id: int, user=Depends(current_user)):
         run = db.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
         if not run:
             raise HTTPException(404, "Run not found")
-        rows = db.execute("SELECT * FROM results WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
+        rows = db.execute("""SELECT x.*,f.verdict my_feedback,
+          (SELECT COUNT(*) FROM result_feedback f2 WHERE f2.result_id=x.id) feedback_count
+          FROM results x LEFT JOIN result_feedback f ON f.result_id=x.id AND f.reviewer_id=?
+          WHERE x.run_id=? ORDER BY x.id""", (user["id"], run_id)).fetchall()
     return [{**dict(r), "left": json.loads(r["left_json"]) if r["left_json"] else None,
              "right": json.loads(r["right_json"]) if r["right_json"] else None} for r in rows]
+
+@app.post("/api/runs/{run_id}/results/{result_id}/feedback")
+def submit_result_feedback(run_id: int, result_id: int, payload: ResultFeedback, user=Depends(require("analyst"))):
+    allowed = {"confirmed_match", "false_match", "correct_pair", "unmatched_confirmed"}
+    if payload.verdict not in allowed:
+        raise HTTPException(400, "Unsupported feedback verdict")
+    with connect() as db:
+        result = db.execute("SELECT * FROM results WHERE id=? AND run_id=?", (result_id, run_id)).fetchone()
+        run = db.execute("SELECT left_dataset_id,right_dataset_id FROM runs WHERE id=?", (run_id,)).fetchone()
+        if not result or not run:
+            raise HTTPException(404, "Run result not found")
+        if payload.verdict == "confirmed_match" and result["status"] != "matched":
+            raise HTTPException(400, "Only a matched result can be confirmed")
+        if payload.verdict == "false_match" and result["status"] != "matched":
+            raise HTTPException(400, "Only a matched result can be marked as a false match")
+        if payload.verdict == "unmatched_confirmed" and result["status"] == "matched":
+            raise HTTPException(400, "A matched result cannot be confirmed as unmatched")
+        if payload.verdict == "correct_pair":
+            if payload.corrected_left_index is None or payload.corrected_right_index is None:
+                raise HTTPException(400, "A corrected pair needs both source row indexes")
+            left = db.execute("SELECT row_count FROM datasets WHERE id=?", (run["left_dataset_id"],)).fetchone()
+            right = db.execute("SELECT row_count FROM datasets WHERE id=?", (run["right_dataset_id"],)).fetchone()
+            if payload.corrected_left_index >= left["row_count"] or payload.corrected_right_index >= right["row_count"]:
+                raise HTTPException(400, "Corrected pair row index is outside its source dataset")
+        db.execute("""INSERT INTO result_feedback(result_id,reviewer_id,verdict,corrected_left_index,corrected_right_index,comment)
+          VALUES(?,?,?,?,?,?) ON CONFLICT(result_id,reviewer_id) DO UPDATE SET verdict=excluded.verdict,
+          corrected_left_index=excluded.corrected_left_index,corrected_right_index=excluded.corrected_right_index,
+          comment=excluded.comment,created_at=CURRENT_TIMESTAMP""",
+          (result_id, user["id"], payload.verdict, payload.corrected_left_index, payload.corrected_right_index, payload.comment))
+        audit(db, user["id"], "label_reconciliation_result", "result", result_id, {"verdict": payload.verdict})
+    return {"result_id": result_id, "verdict": payload.verdict}
+
+@app.get("/api/learning/summary")
+def learning_summary(user=Depends(current_user)):
+    with connect() as db:
+        row = db.execute("""SELECT COUNT(*) labels,
+          SUM(CASE WHEN verdict IN ('confirmed_match','correct_pair') THEN 1 ELSE 0 END) positive,
+          SUM(CASE WHEN verdict='false_match' THEN 1 ELSE 0 END) false_matches,
+          SUM(CASE WHEN verdict='unmatched_confirmed' THEN 1 ELSE 0 END) confirmed_unmatched
+          FROM result_feedback""").fetchone()
+        reviewers = db.execute("SELECT COUNT(DISTINCT reviewer_id) reviewers FROM result_feedback").fetchone()["reviewers"]
+    total = row["labels"] or 0
+    positive = row["positive"] or 0
+    precision = positive / (positive + (row["false_matches"] or 0)) if positive + (row["false_matches"] or 0) else None
+    return {"labels": total, "positive_examples": positive, "false_matches": row["false_matches"] or 0,
+            "confirmed_unmatched": row["confirmed_unmatched"] or 0, "reviewers": reviewers,
+            "observed_precision": round(precision, 4) if precision is not None else None,
+            "automatic_learning_enabled": False,
+            "message": "Reviewer labels are retained for evaluation. Learned matching behavior requires a reviewed proposal and explicit activation."}
 
 @app.post("/api/runs/{run_id}/approval")
 def request_approval(run_id: int, user=Depends(require("analyst"))):

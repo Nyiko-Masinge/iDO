@@ -30,6 +30,8 @@ Open http://127.0.0.1:8000. On first start, iDO creates the local database and a
 
 The generic matcher compares normalized values across mapped fields and optionally applies a numeric tolerance to different amount columns on each side. Matching is one-to-one and uses a keyed index rather than comparing every row pair. Results retain source row values and include an explanation. Imports accept CSV and XLSX (first worksheet); exports are CSV. Dashboard reporting currently includes aggregate match rate and daily run trends.
 
+Reviewers can confirm matches, flag false matches, confirm exceptions, and record corrected pairs. These decisions form a persisted evaluation set and contribute to observed reviewed-match precision. They do not change matching behavior automatically: candidate learning changes need evaluation and explicit activation before production use.
+
 ## Roles
 
 - `admin`: user management, workflow and run management, and approvals.

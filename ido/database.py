@@ -45,6 +45,13 @@ CREATE TABLE IF NOT EXISTS workflow_templates (
  config_json TEXT NOT NULL, created_by INTEGER NOT NULL REFERENCES users(id),
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS result_feedback (
+ id INTEGER PRIMARY KEY, result_id INTEGER NOT NULL REFERENCES results(id) ON DELETE CASCADE,
+ reviewer_id INTEGER NOT NULL REFERENCES users(id), verdict TEXT NOT NULL CHECK(verdict IN ('confirmed_match','false_match','correct_pair','unmatched_confirmed')),
+ corrected_left_index INTEGER, corrected_right_index INTEGER, comment TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ UNIQUE(result_id, reviewer_id)
+);
 CREATE TABLE IF NOT EXISTS audit_log (
  id INTEGER PRIMARY KEY, actor_id INTEGER REFERENCES users(id), action TEXT NOT NULL,
  entity_type TEXT NOT NULL, entity_id INTEGER, details_json TEXT NOT NULL DEFAULT '{}',
