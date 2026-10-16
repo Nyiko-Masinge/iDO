@@ -7,7 +7,7 @@ Local-first reconciliation software for bank and general-purpose data workflows.
 - Python 3.11+
 - Windows, macOS, or Linux
 
-The first local version uses SQLite, so no database server is needed. PostgreSQL support is a planned migration before shared or production deployment; this initial database adapter does not yet consume `IDO_DATABASE_URL`.
+The first local version uses SQLite, so no database server is needed. PostgreSQL support remains a planned migration before shared or production deployment.
 
 ## Run locally
 
@@ -19,16 +19,16 @@ $env:IDO_BOOTSTRAP_ADMIN_PASSWORD = "change-this-before-first-run"
 uvicorn ido.main:app --reload
 ```
 
-Open http://127.0.0.1:8000. On first start, iDO creates the local database and a `admin` user. The bootstrap password is read only when that account does not already exist. Set `IDO_SECRET_KEY` to a long random value before using the app with real data. Database and uploaded files default to `./data` and can be relocated with `IDO_DATA_DIR`.
+Open http://127.0.0.1:8000. On first start, iDO creates the local database and an `admin` user. The bootstrap password is read only when that account does not already exist; if the environment variable is unset, a generated password is printed in the server console. Database and uploaded files default to `./data` and can be relocated with `IDO_DATA_DIR`.
 
 ## First workflow
 
 1. Sign in as the bootstrap administrator and create named users with the appropriate role.
-2. Upload a left-side and right-side CSV dataset.
-3. Create a reconciliation run, choose fields to compare, and set an optional numeric tolerance.
+2. Upload a left-side and right-side CSV or XLSX dataset.
+3. Map fields across the two datasets, set an optional amount tolerance, and save the setup as a reusable workflow template if desired.
 4. Review matched and unmatched rows. Any user can request approval; an administrator or approver can approve or reject it.
 
-The generic matcher compares normalized values across chosen fields and optionally applies a numeric tolerance to one amount field. Each row is used at most once. Results retain source row values and include an explanation. CSV is supported in this first vertical slice; Excel support and field-to-field mapping between different column names are planned next.
+The generic matcher compares normalized values across mapped fields and optionally applies a numeric tolerance to different amount columns on each side. Matching is one-to-one and uses a keyed index rather than comparing every row pair. Results retain source row values and include an explanation. Imports accept CSV and XLSX (first worksheet); exports are CSV. Dashboard reporting currently includes aggregate match rate and daily run trends.
 
 ## Roles
 
@@ -39,7 +39,7 @@ The generic matcher compares normalized values across chosen fields and optional
 
 ## Structure
 
-- `ido/main.py`: API, authentication, authorization, and server startup.
+- `ido/main.py`: API, authentication, authorization, imports, workflows, analytics, and exports.
 - `ido/database.py`: local database setup and schema.
 - `ido/reconcile.py`: reusable matching engine.
 - `ido/static/`: local web interface.

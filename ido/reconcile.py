@@ -1,5 +1,6 @@
-import json
 import re
+from bisect import bisect_left
+from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
 def normalize(value):
@@ -11,36 +12,90 @@ def normalize(value):
 def number(value):
     if value is None:
         return None
-    cleaned = re.sub(r"[^0-9.\-]", "", str(value).replace(",", ""))
+    text = str(value).strip()
+    negative = text.startswith("(") and text.endswith(")")
+    text = re.sub(r"[^0-9,.+\-]", "", text.strip("()"))
+    if "," in text and "." in text:
+        decimal_separator = "," if text.rfind(",") > text.rfind(".") else "."
+        thousands_separator = "." if decimal_separator == "," else ","
+        text = text.replace(thousands_separator, "").replace(decimal_separator, ".")
+    elif "," in text:
+        tail = text.rsplit(",", 1)[-1]
+        if len(tail) in {1, 2}:
+            text = text[:text.rfind(",")].replace(",", "") + "." + tail
+        else:
+            text = text.replace(",", "")
+    elif text.count(".") > 1:
+        tail = text.rsplit(".", 1)[-1]
+        text = text[:text.rfind(".")].replace(".", "") + ("." + tail if len(tail) in {1, 2} else tail)
+    if negative and not text.startswith("-"):
+        text = "-" + text
     try:
-        return Decimal(cleaned) if cleaned else None
+        return Decimal(text) if text else None
     except InvalidOperation:
         return None
 
 def reconcile(left_rows, right_rows, config):
     """Greedy one-to-one matcher over configured keys with optional amount tolerance."""
-    keys = config.get("keys", [])
-    amount = config.get("amount_field")
+    mappings = config.get("key_mappings") or [{"left": key, "right": key} for key in config.get("keys", [])]
+    amount = config.get("amount_mapping")
+    if not amount and config.get("amount_field"):
+        amount = {"left": config["amount_field"], "right": config["amount_field"]}
     tolerance = Decimal(str(config.get("tolerance", "0")))
+    right_groups = defaultdict(list)
+    for ri, right in enumerate(right_rows):
+        key = tuple(normalize(right.get(m["right"])) for m in mappings)
+        if not key or any(value == "" for value in key):
+            continue
+        value = number(right.get(amount["right"])) if amount else None
+        if amount and value is None:
+            continue
+        right_groups[key].append((value, ri))
+    for group in right_groups.values():
+        group.sort(key=lambda item: (item[0] if item[0] is not None else Decimal(0), item[1]))
+    right_values = {key: [item[0] for item in group] for key, group in right_groups.items()}
     right_used = set()
     results = []
     for li, left in enumerate(left_rows):
-        candidates = []
-        for ri, right in enumerate(right_rows):
-            if ri in right_used:
-                continue
-            if not keys or not all(normalize(left.get(k)) == normalize(right.get(k)) for k in keys):
-                continue
-            if amount:
-                lv, rv = number(left.get(amount)), number(right.get(amount))
-                if lv is None or rv is None or abs(lv - rv) > tolerance:
-                    continue
-                diff = abs(lv - rv)
-            else:
-                diff = Decimal(0)
-            candidates.append((diff, ri))
-        if candidates:
-            diff, ri = min(candidates)
+        key = tuple(normalize(left.get(m["left"])) for m in mappings)
+        group = right_groups.get(key, [])
+        match = None
+        diff = Decimal(0)
+        if not key or any(value == "" for value in key):
+            group = []
+        elif amount:
+            left_amount = number(left.get(amount["left"]))
+            values = right_values.get(key, [])
+            if left_amount is not None:
+                pos = bisect_left(values, left_amount)
+                lo, hi = pos - 1, pos
+                while lo >= 0 or hi < len(group):
+                    left_diff = abs(group[lo][0] - left_amount) if lo >= 0 and group[lo][0] is not None else None
+                    right_diff = abs(group[hi][0] - left_amount) if hi < len(group) and group[hi][0] is not None else None
+                    if left_diff is None:
+                        lo -= 1
+                        continue
+                    if right_diff is None:
+                        hi += 1
+                        continue
+                    if left_diff <= right_diff:
+                        candidate_diff, ri = left_diff, group[lo][1]
+                        lo -= 1
+                    else:
+                        candidate_diff, ri = right_diff, group[hi][1]
+                        hi += 1
+                    if candidate_diff > tolerance:
+                        break
+                    if ri not in right_used:
+                        match, diff = ri, candidate_diff
+                        break
+        else:
+            for _, ri in group:
+                if ri not in right_used:
+                    match = ri
+                    break
+        if match is not None:
+            ri = match
             right_used.add(ri)
             results.append({"left_index": li, "right_index": ri, "status": "matched", "score": 1.0 if not amount else float(1 - min(diff / max(tolerance, Decimal("0.01")), Decimal(1))), "explanation": f"Configured fields matched; amount difference {diff}." if amount else "Configured fields matched exactly.", "left": left, "right": right_rows[ri]})
         else:

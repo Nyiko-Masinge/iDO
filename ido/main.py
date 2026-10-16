@@ -4,11 +4,14 @@ import hmac
 import io
 import json
 import os
+import re
 import secrets
+import zipfile
+from datetime import date, datetime
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -36,9 +39,11 @@ async def lifespan(app):
     init_db()
     with connect() as db:
         if not db.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
-            initial = os.getenv("IDO_BOOTSTRAP_ADMIN_PASSWORD") or secrets.token_urlsafe(18)
+            configured_password = os.getenv("IDO_BOOTSTRAP_ADMIN_PASSWORD")
+            initial = configured_password or secrets.token_urlsafe(18)
             db.execute("INSERT INTO users(username,password_hash,role) VALUES(?,?, 'admin')", ("admin", password_hash(initial)))
-            print(f"iDO bootstrap administrator password (save it now): {initial}")
+            if not configured_password:
+                print(f"iDO bootstrap administrator password (save it now): {initial}")
     yield
 
 app = FastAPI(title="iDO Reconciliation Platform", version="0.1.0", lifespan=lifespan)
@@ -57,13 +62,23 @@ class RunInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     left_dataset_id: int
     right_dataset_id: int
-    keys: list[str] = []
+    key_mappings: list[dict[str, str]] = Field(default_factory=list)
+    amount_mapping: dict[str, str] | None = None
+    # Backward-compatible fields for earlier saved frontend requests.
+    keys: list[str] = Field(default_factory=list)
     amount_field: str | None = None
     tolerance: float = Field(default=0, ge=0)
 
 class ApprovalDecision(BaseModel):
     decision: str
     comment: str = ""
+
+class WorkflowInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=500)
+    key_mappings: list[dict[str, str]] = Field(default_factory=list)
+    amount_mapping: dict[str, str] | None = None
+    tolerance: float = Field(default=0, ge=0)
 
 def current_user(authorization: str | None = Header(default=None)):
     if not authorization or not authorization.startswith("Bearer "):
@@ -133,20 +148,33 @@ def create_user(payload: NewUser, user=Depends(require("admin"))):
 
 @app.post("/api/datasets")
 async def upload_dataset(name: str, file: UploadFile = File(...), user=Depends(require("analyst"))):
-    if not file.filename or not file.filename.lower().endswith(".csv"):
-        raise HTTPException(400, "Upload a CSV file")
+    if not file.filename or not file.filename.lower().endswith((".csv", ".xlsx")):
+        raise HTTPException(400, "Upload a CSV or XLSX file")
     raw = await file.read(25 * 1024 * 1024 + 1)
     if len(raw) > 25 * 1024 * 1024:
         raise HTTPException(413, "File exceeds the 25 MB local upload limit")
     try:
-        text = raw.decode("utf-8-sig")
-        reader = csv.DictReader(io.StringIO(text))
-        columns = reader.fieldnames or []
-        rows = list(reader)
-    except (UnicodeDecodeError, csv.Error) as exc:
+        if file.filename.lower().endswith(".xlsx"):
+            from openpyxl import load_workbook
+            workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            sheet = workbook.active
+            iterator = sheet.iter_rows(values_only=True)
+            headers = next(iterator, ())
+            columns = [str(value).strip() if value is not None else "" for value in headers]
+            rows = [dict(zip(columns, [value.isoformat() if isinstance(value, (date, datetime)) else value for value in values])) for values in iterator]
+            rows = [{k: (str(v) if v is not None else "") for k, v in row.items()} for row in rows]
+            workbook.close()
+        else:
+            text = raw.decode("utf-8-sig")
+            reader = csv.DictReader(io.StringIO(text))
+            columns = reader.fieldnames or []
+            rows = list(reader)
+    except (UnicodeDecodeError, csv.Error, ValueError, StopIteration, zipfile.BadZipFile) as exc:
         raise HTTPException(400, f"Unable to read CSV: {exc}")
     if not columns or not rows:
         raise HTTPException(400, "CSV must have a header and at least one data row")
+    if any(not column for column in columns) or len({column.casefold() for column in columns}) != len(columns):
+        raise HTTPException(400, "Column headers must be non-empty and unique (ignoring letter case)")
     if len(rows) > 100_000:
         raise HTTPException(400, "CSV exceeds the 100,000 row local limit")
     with connect() as db:
@@ -159,6 +187,24 @@ async def upload_dataset(name: str, file: UploadFile = File(...), user=Depends(r
 def datasets(user=Depends(current_user)):
     with connect() as db:
         return [dict(r) for r in db.execute("SELECT id,name,source_name,columns_json,row_count,created_at FROM datasets ORDER BY id DESC")]
+
+@app.get("/api/datasets/{dataset_id}/profile")
+def dataset_profile(dataset_id: int, user=Depends(current_user)):
+    with connect() as db:
+        dataset = db.execute("SELECT * FROM datasets WHERE id=?", (dataset_id,)).fetchone()
+    if not dataset:
+        raise HTTPException(404, "Dataset not found")
+    rows = json.loads(dataset["rows_json"])
+    profiles = []
+    for column in json.loads(dataset["columns_json"]):
+        values = [str(row.get(column, "")).strip() for row in rows]
+        populated = [value for value in values if value]
+        numeric = sum(1 for value in populated if re.fullmatch(r"[-+]?\d[\d,]*(\.\d+)?", value))
+        profiles.append({"column": column, "populated": len(populated), "missing": len(values) - len(populated),
+                         "unique": len(set(populated)), "numeric_share": round(numeric / len(populated), 3) if populated else 0,
+                         "sample_values": list(dict.fromkeys(populated))[:4]})
+    return {"id": dataset["id"], "name": dataset["name"], "row_count": dataset["row_count"], "columns": profiles,
+            "preview": rows[:5]}
 
 @app.get("/api/runs")
 def runs(user=Depends(current_user)):
@@ -179,11 +225,15 @@ def create_run(payload: RunInput, user=Depends(require("analyst"))):
             raise HTTPException(404, "Dataset not found")
         left_rows, right_rows = json.loads(left["rows_json"]), json.loads(right["rows_json"])
         left_cols, right_cols = json.loads(left["columns_json"]), json.loads(right["columns_json"])
-        if any(k not in left_cols or k not in right_cols for k in payload.keys):
-            raise HTTPException(400, "Every matching key must exist in both datasets")
-        if payload.amount_field and (payload.amount_field not in left_cols or payload.amount_field not in right_cols):
-            raise HTTPException(400, "Amount field must exist in both datasets")
-        config = {"keys": payload.keys, "amount_field": payload.amount_field, "tolerance": payload.tolerance}
+        mappings = payload.key_mappings or [{"left": k, "right": k} for k in payload.keys]
+        amount_mapping = payload.amount_mapping or ({"left": payload.amount_field, "right": payload.amount_field} if payload.amount_field else None)
+        if not mappings:
+            raise HTTPException(400, "Select at least one field mapping")
+        if any(m.get("left") not in left_cols or m.get("right") not in right_cols for m in mappings):
+            raise HTTPException(400, "Every mapped field must exist in its selected dataset")
+        if amount_mapping and (amount_mapping.get("left") not in left_cols or amount_mapping.get("right") not in right_cols):
+            raise HTTPException(400, "Amount mapping fields must exist in their selected datasets")
+        config = {"key_mappings": mappings, "amount_mapping": amount_mapping, "tolerance": payload.tolerance}
         cur = db.execute("INSERT INTO runs(name,left_dataset_id,right_dataset_id,config_json,status,created_by) VALUES(?,?,?,?,?,?)",
                          (payload.name, left["id"], right["id"], json.dumps(config), "completed", user["id"]))
         run_id = cur.lastrowid
@@ -193,6 +243,51 @@ def create_run(payload: RunInput, user=Depends(require("analyst"))):
                        (run_id, item["left_index"], item["right_index"], item["status"], item["score"], item["explanation"], json.dumps(item["left"]) if item["left"] is not None else None, json.dumps(item["right"]) if item["right"] is not None else None))
         audit(db, user["id"], "run_reconciliation", "run", run_id, {"result_count": len(results)})
         return {"id": run_id, "name": payload.name, "status": "completed", "result_count": len(results)}
+
+@app.get("/api/workflows")
+def workflows(user=Depends(current_user)):
+    with connect() as db:
+        rows = db.execute("SELECT id,name,description,config_json,created_at,updated_at FROM workflow_templates ORDER BY name").fetchall()
+    return [{**dict(row), "config": json.loads(row["config_json"])} for row in rows]
+
+@app.post("/api/workflows")
+def save_workflow(payload: WorkflowInput, user=Depends(require("analyst"))):
+    if not payload.key_mappings:
+        raise HTTPException(400, "A workflow needs at least one key mapping")
+    if any(not item.get("left") or not item.get("right") for item in payload.key_mappings):
+        raise HTTPException(400, "Each mapping needs left and right fields")
+    config = {"key_mappings": payload.key_mappings, "amount_mapping": payload.amount_mapping, "tolerance": payload.tolerance}
+    with connect() as db:
+        cur = db.execute("INSERT INTO workflow_templates(name,description,config_json,created_by) VALUES(?,?,?,?)",
+                         (payload.name, payload.description, json.dumps(config), user["id"]))
+        audit(db, user["id"], "save_workflow", "workflow", cur.lastrowid)
+        return {"id": cur.lastrowid, "name": payload.name, "description": payload.description, "config": config}
+
+@app.get("/api/analytics")
+def analytics(user=Depends(current_user)):
+    with connect() as db:
+        totals = db.execute("SELECT COUNT(*) runs, COALESCE(SUM(matched),0) matched, COALESCE(SUM(exceptions),0) exceptions FROM (SELECT r.id,SUM(CASE WHEN x.status='matched' THEN 1 ELSE 0 END) matched,SUM(CASE WHEN x.status!='matched' THEN 1 ELSE 0 END) exceptions FROM runs r LEFT JOIN results x ON x.run_id=r.id GROUP BY r.id)").fetchone()
+        series = db.execute("SELECT substr(created_at,1,10) day,COUNT(*) runs FROM runs GROUP BY day ORDER BY day DESC LIMIT 30").fetchall()
+        approvals = db.execute("SELECT status,COUNT(*) count FROM approvals GROUP BY status").fetchall()
+    matched, exceptions = totals["matched"], totals["exceptions"]
+    return {"runs": totals["runs"], "matched": matched, "exceptions": exceptions,
+            "match_rate": round(matched / (matched + exceptions), 4) if matched + exceptions else 0,
+            "daily_runs": [dict(r) for r in reversed(series)], "approvals": [dict(r) for r in approvals]}
+
+@app.get("/api/runs/{run_id}/export.csv")
+def export_run(run_id: int, user=Depends(current_user)):
+    with connect() as db:
+        run = db.execute("SELECT name FROM runs WHERE id=?", (run_id,)).fetchone()
+        if not run:
+            raise HTTPException(404, "Run not found")
+        rows = db.execute("SELECT status,score,explanation,left_json,right_json FROM results WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["status", "score", "explanation", "left_record_json", "right_record_json"])
+    for row in rows:
+        writer.writerow([row["status"], row["score"], row["explanation"], row["left_json"] or "", row["right_json"] or ""])
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in run["name"])[:80]
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="ido-run-{run_id}-{safe_name}.csv"'})
 
 @app.get("/api/runs/{run_id}/results")
 def run_results(run_id: int, user=Depends(current_user)):

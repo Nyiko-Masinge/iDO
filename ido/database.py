@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS approvals (
  decided_by INTEGER REFERENCES users(id), comment TEXT, requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
  decided_at TEXT
 );
+CREATE TABLE IF NOT EXISTS workflow_templates (
+ id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+ config_json TEXT NOT NULL, created_by INTEGER NOT NULL REFERENCES users(id),
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS audit_log (
  id INTEGER PRIMARY KEY, actor_id INTEGER REFERENCES users(id), action TEXT NOT NULL,
  entity_type TEXT NOT NULL, entity_id INTEGER, details_json TEXT NOT NULL DEFAULT '{}',
