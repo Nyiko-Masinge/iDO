@@ -42,9 +42,24 @@ def reconcile(left_rows, right_rows, config):
     if not amount and config.get("amount_field"):
         amount = {"left": config["amount_field"], "right": config["amount_field"]}
     tolerance = Decimal(str(config.get("tolerance", "0")))
+    alias_index = defaultdict(list)
+    for alias in config.get("aliases", []):
+        alias_index[(alias["left_field"], alias["right_field"], normalize(alias.get("right_value")))].append(alias)
+
+    def right_key(row):
+        values = []
+        for mapping in mappings:
+            value = normalize(row.get(mapping["right"]))
+            for alias in alias_index.get((mapping["left"], mapping["right"], value), []):
+                if all(normalize(row.get(context["right_field"])) == context["right_value"] for context in alias.get("context", [])):
+                    value = normalize(alias["left_value"])
+                    break
+            values.append(value)
+        return tuple(values)
+
     right_groups = defaultdict(list)
     for ri, right in enumerate(right_rows):
-        key = tuple(normalize(right.get(m["right"])) for m in mappings)
+        key = right_key(right)
         if not key or any(value == "" for value in key):
             continue
         value = number(right.get(amount["right"])) if amount else None

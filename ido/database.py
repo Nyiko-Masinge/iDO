@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS datasets (
 CREATE TABLE IF NOT EXISTS runs (
  id INTEGER PRIMARY KEY, name TEXT NOT NULL, left_dataset_id INTEGER NOT NULL REFERENCES datasets(id),
  right_dataset_id INTEGER NOT NULL REFERENCES datasets(id), config_json TEXT NOT NULL,
+ workflow_template_id INTEGER REFERENCES workflow_templates(id),
  status TEXT NOT NULL DEFAULT 'draft', created_by INTEGER NOT NULL REFERENCES users(id),
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT
 );
@@ -52,6 +53,17 @@ CREATE TABLE IF NOT EXISTS result_feedback (
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
  UNIQUE(result_id, reviewer_id)
 );
+CREATE TABLE IF NOT EXISTS learning_proposals (
+ id INTEGER PRIMARY KEY, workflow_id INTEGER NOT NULL REFERENCES workflow_templates(id) ON DELETE CASCADE,
+ run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+ key_left_field TEXT NOT NULL, key_right_field TEXT NOT NULL,
+ left_value TEXT NOT NULL, right_value TEXT NOT NULL, context_json TEXT NOT NULL,
+ proposed_by INTEGER NOT NULL REFERENCES users(id), status TEXT NOT NULL DEFAULT 'pending'
+  CHECK(status IN ('pending','approved','rejected')),
+ decided_by INTEGER REFERENCES users(id), decision_comment TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, decided_at TEXT,
+ UNIQUE(workflow_id,key_left_field,key_right_field,left_value,right_value,context_json)
+);
 CREATE TABLE IF NOT EXISTS audit_log (
  id INTEGER PRIMARY KEY, actor_id INTEGER REFERENCES users(id), action TEXT NOT NULL,
  entity_type TEXT NOT NULL, entity_id INTEGER, details_json TEXT NOT NULL DEFAULT '{}',
@@ -76,3 +88,6 @@ def connect():
 def init_db():
     with connect() as db:
         db.executescript(SCHEMA)
+        run_columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
+        if "workflow_template_id" not in run_columns:
+            db.execute("ALTER TABLE runs ADD COLUMN workflow_template_id INTEGER REFERENCES workflow_templates(id)")

@@ -1,6 +1,5 @@
 import csv
 import hashlib
-import hmac
 import io
 import json
 import os
@@ -16,19 +15,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .database import connect, init_db
-from .reconcile import reconcile
+from .reconcile import normalize, reconcile
+from .security import password_hash, password_ok
 
 ROLES = {"admin", "approver", "analyst", "viewer"}
 ROLE_RANK = {"viewer": 0, "analyst": 1, "approver": 2, "admin": 3}
-
-def password_hash(password, salt=None):
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 240_000).hex()
-    return f"{salt}${digest}"
-
-def password_ok(password, encoded):
-    salt, _ = encoded.split("$", 1)
-    return hmac.compare_digest(password_hash(password, salt), encoded)
 
 def audit(db, actor, action, entity, entity_id=None, details=None):
     db.execute("INSERT INTO audit_log(actor_id,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?)",
@@ -68,6 +59,7 @@ class RunInput(BaseModel):
     keys: list[str] = Field(default_factory=list)
     amount_field: str | None = None
     tolerance: float = Field(default=0, ge=0)
+    workflow_template_id: int | None = Field(default=None, ge=1)
 
 class ApprovalDecision(BaseModel):
     decision: str
@@ -239,9 +231,18 @@ def create_run(payload: RunInput, user=Depends(require("analyst"))):
             raise HTTPException(400, "Every mapped field must exist in its selected dataset")
         if amount_mapping and (amount_mapping.get("left") not in left_cols or amount_mapping.get("right") not in right_cols):
             raise HTTPException(400, "Amount mapping fields must exist in their selected datasets")
-        config = {"key_mappings": mappings, "amount_mapping": amount_mapping, "tolerance": payload.tolerance}
-        cur = db.execute("INSERT INTO runs(name,left_dataset_id,right_dataset_id,config_json,status,created_by) VALUES(?,?,?,?,?,?)",
-                         (payload.name, left["id"], right["id"], json.dumps(config), "completed", user["id"]))
+        aliases = []
+        if payload.workflow_template_id:
+            template = db.execute("SELECT config_json FROM workflow_templates WHERE id=?", (payload.workflow_template_id,)).fetchone()
+            if not template:
+                raise HTTPException(404, "Workflow template not found")
+            template_config = json.loads(template["config_json"])
+            if mappings != template_config.get("key_mappings", []):
+                raise HTTPException(400, "Selected field mappings differ from the chosen workflow template")
+            aliases = template_config.get("aliases", [])
+        config = {"key_mappings": mappings, "amount_mapping": amount_mapping, "tolerance": payload.tolerance, "aliases": aliases}
+        cur = db.execute("INSERT INTO runs(name,left_dataset_id,right_dataset_id,config_json,workflow_template_id,status,created_by) VALUES(?,?,?,?,?,?,?)",
+                         (payload.name, left["id"], right["id"], json.dumps(config), payload.workflow_template_id, "completed", user["id"]))
         run_id = cur.lastrowid
         results = reconcile(left_rows, right_rows, config)
         for item in results:
@@ -315,7 +316,7 @@ def submit_result_feedback(run_id: int, result_id: int, payload: ResultFeedback,
         raise HTTPException(400, "Unsupported feedback verdict")
     with connect() as db:
         result = db.execute("SELECT * FROM results WHERE id=? AND run_id=?", (result_id, run_id)).fetchone()
-        run = db.execute("SELECT left_dataset_id,right_dataset_id FROM runs WHERE id=?", (run_id,)).fetchone()
+        run = db.execute("SELECT left_dataset_id,right_dataset_id,workflow_template_id,config_json FROM runs WHERE id=?", (run_id,)).fetchone()
         if not result or not run:
             raise HTTPException(404, "Run result not found")
         if payload.verdict == "confirmed_match" and result["status"] != "matched":
@@ -331,13 +332,76 @@ def submit_result_feedback(run_id: int, result_id: int, payload: ResultFeedback,
             right = db.execute("SELECT row_count FROM datasets WHERE id=?", (run["right_dataset_id"],)).fetchone()
             if payload.corrected_left_index >= left["row_count"] or payload.corrected_right_index >= right["row_count"]:
                 raise HTTPException(400, "Corrected pair row index is outside its source dataset")
+            if result["status"] != "unmatched_left" or result["left_index"] != payload.corrected_left_index:
+                raise HTTPException(400, "Corrected pairs must start from this unmatched left-side result")
+            if not db.execute("SELECT 1 FROM results WHERE run_id=? AND status='unmatched_right' AND right_index=?", (run_id, payload.corrected_right_index)).fetchone():
+                raise HTTPException(400, "The selected right-side row is not an unmatched result in this run")
         db.execute("""INSERT INTO result_feedback(result_id,reviewer_id,verdict,corrected_left_index,corrected_right_index,comment)
           VALUES(?,?,?,?,?,?) ON CONFLICT(result_id,reviewer_id) DO UPDATE SET verdict=excluded.verdict,
           corrected_left_index=excluded.corrected_left_index,corrected_right_index=excluded.corrected_right_index,
           comment=excluded.comment,created_at=CURRENT_TIMESTAMP""",
           (result_id, user["id"], payload.verdict, payload.corrected_left_index, payload.corrected_right_index, payload.comment))
         audit(db, user["id"], "label_reconciliation_result", "result", result_id, {"verdict": payload.verdict})
-    return {"result_id": result_id, "verdict": payload.verdict}
+        proposal_id = None
+        if payload.verdict == "correct_pair" and run["workflow_template_id"]:
+            left_rows = json.loads(db.execute("SELECT rows_json FROM datasets WHERE id=?", (run["left_dataset_id"],)).fetchone()["rows_json"])
+            right_rows = json.loads(db.execute("SELECT rows_json FROM datasets WHERE id=?", (run["right_dataset_id"],)).fetchone()["rows_json"])
+            left_row, right_row = left_rows[payload.corrected_left_index], right_rows[payload.corrected_right_index]
+            mappings = json.loads(run["config_json"]).get("key_mappings", [])
+            differences = [m for m in mappings if normalize(left_row.get(m["left"])) != normalize(right_row.get(m["right"]))]
+            others_match = all(normalize(left_row.get(m["left"])) == normalize(right_row.get(m["right"])) for m in mappings if m not in differences)
+            if len(differences) == 1 and others_match and normalize(left_row.get(differences[0]["left"])) and normalize(right_row.get(differences[0]["right"])):
+                changed = differences[0]
+                context = [{"left_field": m["left"], "right_field": m["right"],
+                            "left_value": normalize(left_row.get(m["left"])), "right_value": normalize(right_row.get(m["right"]))}
+                           for m in mappings if m is not changed]
+                cur = db.execute("""INSERT OR IGNORE INTO learning_proposals(workflow_id,run_id,key_left_field,key_right_field,left_value,right_value,context_json,proposed_by)
+                  VALUES(?,?,?,?,?,?,?,?)""", (run["workflow_template_id"], run_id, changed["left"], changed["right"],
+                   str(left_row.get(changed["left"], "")), str(right_row.get(changed["right"], "")), json.dumps(context, sort_keys=True), user["id"]))
+                proposal_id = cur.lastrowid if cur.rowcount else None
+                if proposal_id:
+                    audit(db, user["id"], "propose_learned_alias", "learning_proposal", proposal_id)
+    return {"result_id": result_id, "verdict": payload.verdict, "learning_proposal_id": proposal_id}
+
+@app.get("/api/learning/proposals")
+def learning_proposals(user=Depends(current_user)):
+    with connect() as db:
+        rows = db.execute("""SELECT p.*,w.name workflow_name,u.username proposer
+          FROM learning_proposals p JOIN workflow_templates w ON w.id=p.workflow_id
+          JOIN users u ON u.id=p.proposed_by ORDER BY CASE p.status WHEN 'pending' THEN 0 ELSE 1 END,p.id DESC""").fetchall()
+    return [{**dict(row), "context": json.loads(row["context_json"])} for row in rows]
+
+@app.post("/api/learning/proposals/{proposal_id}/decision")
+def decide_learning_proposal(proposal_id: int, payload: ApprovalDecision, user=Depends(require("approver"))):
+    if payload.decision not in {"approved", "rejected"}:
+        raise HTTPException(400, "Decision must be approved or rejected")
+    with connect() as db:
+        proposal = db.execute("SELECT * FROM learning_proposals WHERE id=?", (proposal_id,)).fetchone()
+        if not proposal or proposal["status"] != "pending":
+            raise HTTPException(409, "No pending learning proposal")
+        if proposal["proposed_by"] == user["id"]:
+            raise HTTPException(403, "The proposer cannot approve their own learning proposal")
+        if payload.decision == "approved":
+            workflow = db.execute("SELECT config_json FROM workflow_templates WHERE id=?", (proposal["workflow_id"],)).fetchone()
+            config = json.loads(workflow["config_json"])
+            alias = {"left_field": proposal["key_left_field"], "right_field": proposal["key_right_field"],
+                     "left_value": proposal["left_value"], "right_value": proposal["right_value"],
+                     "context": json.loads(proposal["context_json"])}
+            aliases = config.setdefault("aliases", [])
+            conflict = any(item["left_field"] == alias["left_field"] and item["right_field"] == alias["right_field"]
+                           and normalize(item.get("right_value")) == normalize(alias["right_value"])
+                           and item.get("context", []) == alias["context"]
+                           and normalize(item.get("left_value")) != normalize(alias["left_value"]) for item in aliases)
+            if conflict:
+                raise HTTPException(409, "This source value already has a different approved alias in the workflow")
+            if alias not in aliases:
+                aliases.append(alias)
+                db.execute("UPDATE workflow_templates SET config_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(config), proposal["workflow_id"]))
+        db.execute("UPDATE learning_proposals SET status=?,decided_by=?,decision_comment=?,decided_at=CURRENT_TIMESTAMP WHERE id=?",
+                   (payload.decision, user["id"], payload.comment, proposal_id))
+        audit(db, user["id"], payload.decision + "_learning_proposal", "learning_proposal", proposal_id,
+              {"workflow_id": proposal["workflow_id"], "comment": payload.comment})
+    return {"proposal_id": proposal_id, "status": payload.decision}
 
 @app.get("/api/learning/summary")
 def learning_summary(user=Depends(current_user)):
@@ -348,11 +412,13 @@ def learning_summary(user=Depends(current_user)):
           SUM(CASE WHEN verdict='unmatched_confirmed' THEN 1 ELSE 0 END) confirmed_unmatched
           FROM result_feedback""").fetchone()
         reviewers = db.execute("SELECT COUNT(DISTINCT reviewer_id) reviewers FROM result_feedback").fetchone()["reviewers"]
+        proposals = db.execute("SELECT SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending,SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) approved FROM learning_proposals").fetchone()
     total = row["labels"] or 0
     positive = row["positive"] or 0
     precision = positive / (positive + (row["false_matches"] or 0)) if positive + (row["false_matches"] or 0) else None
     return {"labels": total, "positive_examples": positive, "false_matches": row["false_matches"] or 0,
             "confirmed_unmatched": row["confirmed_unmatched"] or 0, "reviewers": reviewers,
+            "pending_proposals": proposals["pending"] or 0, "approved_proposals": proposals["approved"] or 0,
             "observed_precision": round(precision, 4) if precision is not None else None,
             "automatic_learning_enabled": False,
             "message": "Reviewer labels are retained for evaluation. Learned matching behavior requires a reviewed proposal and explicit activation."}

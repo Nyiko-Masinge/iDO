@@ -21,6 +21,8 @@ uvicorn ido.main:app --reload
 
 Open http://127.0.0.1:8000. On first start, iDO creates the local database and an `admin` user. The bootstrap password is read only when that account does not already exist; if the environment variable is unset, a generated password is printed in the server console. Database and uploaded files default to `./data` and can be relocated with `IDO_DATA_DIR`.
 
+If you lose a local user's password, stop the server and run `python -m ido.reset_admin` from this project directory. It prompts securely for the new password, invalidates that user's sessions, and keeps datasets and workflows.
+
 ## First workflow
 
 1. Sign in as the bootstrap administrator and create named users with the appropriate role.
@@ -30,7 +32,7 @@ Open http://127.0.0.1:8000. On first start, iDO creates the local database and a
 
 The generic matcher compares normalized values across mapped fields and optionally applies a numeric tolerance to different amount columns on each side. Matching is one-to-one and uses a keyed index rather than comparing every row pair. Results retain source row values and include an explanation. Imports accept CSV and XLSX (first worksheet); exports are CSV. Dashboard reporting currently includes aggregate match rate and daily run trends.
 
-Reviewers can confirm matches, flag false matches, confirm exceptions, and record corrected pairs. These decisions form a persisted evaluation set and contribute to observed reviewed-match precision. They do not change matching behavior automatically: candidate learning changes need evaluation and explicit activation before production use.
+Reviewers can confirm matches, flag false matches, confirm exceptions, and record corrected pairs. These decisions form a persisted evaluation set and contribute to observed reviewed-match precision. A corrected pair can create a scoped alias proposal only when one configured key differs and the remaining mapped keys agree. A different approver must approve the proposal; accepted aliases are applied only to later runs that select the same saved workflow, and remain scoped to the agreeing context fields.
 
 ## Roles
 
