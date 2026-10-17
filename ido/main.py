@@ -9,13 +9,13 @@ import zipfile
 from datetime import date, datetime
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .database import connect, init_db
-from .reconcile import normalize, reconcile
+from .reconcile import normalize, number, reconcile
 from .security import password_hash, password_ok
 
 ROLES = {"admin", "approver", "analyst", "viewer"}
@@ -280,6 +280,142 @@ def analytics(user=Depends(current_user)):
     return {"runs": totals["runs"], "matched": matched, "exceptions": exceptions,
             "match_rate": round(matched / (matched + exceptions), 4) if matched + exceptions else 0,
             "daily_runs": [dict(r) for r in reversed(series)], "approvals": [dict(r) for r in approvals]}
+
+def build_report(date_from=None, date_to=None, workflow_id=None, approval_status=None):
+    clauses, params = [], []
+    if date_from:
+        clauses.append("substr(r.created_at,1,10)>=?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("substr(r.created_at,1,10)<=?")
+        params.append(date_to)
+    if workflow_id:
+        clauses.append("r.workflow_template_id=?")
+        params.append(workflow_id)
+    if approval_status:
+        clauses.append("COALESCE(a.status,'not_requested')=?")
+        params.append(approval_status)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with connect() as db:
+        selected = db.execute("""SELECT r.id,r.name,r.created_at,r.status,r.workflow_template_id,r.config_json,
+          d1.name left_dataset,d2.name right_dataset,w.name workflow_name,
+          COALESCE(a.status,'not_requested') approval_status
+          FROM runs r JOIN datasets d1 ON d1.id=r.left_dataset_id JOIN datasets d2 ON d2.id=r.right_dataset_id
+          LEFT JOIN workflow_templates w ON w.id=r.workflow_template_id LEFT JOIN approvals a ON a.run_id=r.id""" + where + " ORDER BY r.id DESC", params).fetchall()
+        data = []
+        for run in selected:
+            results = db.execute("SELECT status,score,left_json,right_json FROM results WHERE run_id=? ORDER BY id", (run["id"],)).fetchall()
+            cfg = json.loads(run["config_json"])
+            amount_mapping = cfg.get("amount_mapping") or ({"left": cfg["amount_field"], "right": cfg["amount_field"]} if cfg.get("amount_field") else None)
+            counts = {"matched": 0, "unmatched_left": 0, "unmatched_right": 0}
+            left_amounts = {"matched": Decimal(0), "unmatched": Decimal(0)}
+            right_amounts = {"matched": Decimal(0), "unmatched": Decimal(0)}
+            confidence_sum = 0.0
+            for item in results:
+                status = item["status"]
+                counts[status] = counts.get(status, 0) + 1
+                confidence_sum += item["score"]
+                if amount_mapping:
+                    left_row = json.loads(item["left_json"]) if item["left_json"] else None
+                    right_row = json.loads(item["right_json"]) if item["right_json"] else None
+                    bucket = "matched" if status == "matched" else "unmatched"
+                    if left_row:
+                        left_amounts[bucket] += number(left_row.get(amount_mapping["left"])) or Decimal(0)
+                    if right_row:
+                        right_amounts[bucket] += number(right_row.get(amount_mapping["right"])) or Decimal(0)
+            matched, left_exc, right_exc = counts["matched"], counts["unmatched_left"], counts["unmatched_right"]
+            total = matched + left_exc + right_exc
+            variance = right_amounts["matched"] - left_amounts["matched"] if amount_mapping else None
+            data.append({"id": run["id"], "name": run["name"], "created_at": run["created_at"],
+                         "status": run["status"], "approval_status": run["approval_status"],
+                         "workflow_id": run["workflow_template_id"], "workflow_name": run["workflow_name"] or "Ad hoc",
+                         "left_dataset": run["left_dataset"], "right_dataset": run["right_dataset"],
+                         "matched": matched, "unmatched_left": left_exc, "unmatched_right": right_exc,
+                         "exceptions": left_exc + right_exc, "total_records": total,
+                         "match_rate": matched / total if total else 0,
+                         "average_score": confidence_sum / len(results) if results else 0,
+                         "amount_mapping": amount_mapping,
+                         "matched_left_amount": float(left_amounts["matched"]) if amount_mapping else None,
+                         "matched_right_amount": float(right_amounts["matched"]) if amount_mapping else None,
+                         "matched_variance": float(variance) if variance is not None else None,
+                         "unmatched_left_amount": float(left_amounts["unmatched"]) if amount_mapping else None,
+                         "unmatched_right_amount": float(right_amounts["unmatched"]) if amount_mapping else None})
+    summary = {"runs": len(data), "matched": sum(x["matched"] for x in data),
+               "exceptions": sum(x["exceptions"] for x in data), "unmatched_left": sum(x["unmatched_left"] for x in data),
+               "unmatched_right": sum(x["unmatched_right"] for x in data), "records": sum(x["total_records"] for x in data)}
+    summary["match_rate"] = summary["matched"] / summary["records"] if summary["records"] else 0
+    amount_fields = ["matched_left_amount", "matched_right_amount", "matched_variance", "unmatched_left_amount", "unmatched_right_amount"]
+    amount_runs = [run for run in data if run["amount_mapping"]]
+    amount_totals = {"mapped_runs": len(amount_runs)}
+    for field in amount_fields:
+        amount_totals[field] = float(sum((Decimal(str(run[field])) for run in amount_runs if run[field] is not None), Decimal(0))) if amount_runs else None
+    status_counts = {}
+    daily = {}
+    for run in data:
+        status_counts[run["approval_status"]] = status_counts.get(run["approval_status"], 0) + 1
+        day = run["created_at"][:10]
+        bucket = daily.setdefault(day, {"day": day, "runs": 0, "matched": 0, "exceptions": 0})
+        bucket["runs"] += 1
+        bucket["matched"] += run["matched"]
+        bucket["exceptions"] += run["exceptions"]
+    return {"summary": summary, "amount_totals": amount_totals, "runs": data, "approval_breakdown": status_counts,
+            "daily": [daily[day] for day in sorted(daily)],
+            "amount_note": "Amount totals are shown only for runs with an amount mapping. Comparing side totals assumes the mapped fields use the same currency and sign convention."}
+
+def validated_report_filters(date_from, date_to, workflow_id, approval_status):
+    try:
+        if date_from:
+            date.fromisoformat(date_from)
+        if date_to:
+            date.fromisoformat(date_to)
+    except ValueError:
+        raise HTTPException(400, "Dates must use YYYY-MM-DD format")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(400, "Start date must be on or before end date")
+    allowed = {"not_requested", "pending", "approved", "rejected"}
+    if approval_status and approval_status not in allowed:
+        raise HTTPException(400, "Unsupported approval status filter")
+    return date_from, date_to, workflow_id, approval_status
+
+@app.get("/api/reports")
+def reports(date_from: str | None = None, date_to: str | None = None,
+            workflow_id: int | None = Query(default=None, ge=1), approval_status: str | None = None,
+            user=Depends(current_user)):
+    filters = validated_report_filters(date_from, date_to, workflow_id, approval_status)
+    return build_report(*filters)
+
+@app.get("/api/reports/export.csv")
+def export_report(date_from: str | None = None, date_to: str | None = None,
+                  workflow_id: int | None = Query(default=None, ge=1), approval_status: str | None = None,
+                  user=Depends(current_user)):
+    report = build_report(*validated_report_filters(date_from, date_to, workflow_id, approval_status))
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    fields = ["id", "name", "created_at", "workflow_name", "left_dataset", "right_dataset", "approval_status", "matched", "unmatched_left", "unmatched_right", "exceptions", "total_records", "match_rate", "average_score", "matched_left_amount", "matched_right_amount", "matched_variance", "unmatched_left_amount", "unmatched_right_amount"]
+    writer.writerow(fields)
+    for run in report["runs"]:
+        writer.writerow([run.get(field) for field in fields])
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="ido-reconciliation-report.csv"'})
+
+@app.get("/api/reports/exceptions.csv")
+def export_report_exceptions(date_from: str | None = None, date_to: str | None = None,
+                             workflow_id: int | None = Query(default=None, ge=1), approval_status: str | None = None,
+                             user=Depends(current_user)):
+    filters = validated_report_filters(date_from, date_to, workflow_id, approval_status)
+    report = build_report(*filters)
+    ids = [run["id"] for run in report["runs"]]
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["run_id", "run_name", "created_at", "approval_status", "exception_type", "left_record", "right_record", "explanation"])
+    if ids:
+        with connect() as db:
+            for offset in range(0, len(ids), 500):
+                chunk = ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = db.execute(f"SELECT r.id,r.name,r.created_at,a.status approval_status,x.status exception_type,x.left_json,x.right_json,x.explanation FROM results x JOIN runs r ON r.id=x.run_id LEFT JOIN approvals a ON a.run_id=r.id WHERE x.run_id IN ({placeholders}) AND x.status!='matched' ORDER BY r.id DESC,x.id", chunk).fetchall()
+                for row in rows:
+                    writer.writerow([row["id"], row["name"], row["created_at"], row["approval_status"] or "not_requested", row["exception_type"], row["left_json"] or "", row["right_json"] or "", row["explanation"]])
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="ido-reconciliation-exceptions.csv"'})
 
 @app.get("/api/runs/{run_id}/export.csv")
 def export_run(run_id: int, user=Depends(current_user)):
