@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import zipfile
+from decimal import Decimal
 from datetime import date, datetime
 from contextlib import asynccontextmanager
 
