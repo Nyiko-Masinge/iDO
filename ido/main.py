@@ -79,6 +79,10 @@ class WorkflowInput(BaseModel):
     amount_mapping: dict[str, str] | None = None
     tolerance: float = Field(default=0, ge=0)
 
+class ReportViewInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    config: dict = Field(default_factory=dict)
+
 def current_user(authorization: str | None = Header(default=None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Sign in required")
@@ -384,6 +388,44 @@ def reports(date_from: str | None = None, date_to: str | None = None,
             user=Depends(current_user)):
     filters = validated_report_filters(date_from, date_to, workflow_id, approval_status)
     return build_report(*filters)
+
+@app.get("/api/report-views")
+def list_report_views(user=Depends(current_user)):
+    with connect() as db:
+        rows = db.execute("SELECT id,name,config_json,created_at,updated_at FROM report_views WHERE user_id=? ORDER BY name", (user["id"],)).fetchall()
+    return [{**dict(row), "config": json.loads(row["config_json"])} for row in rows]
+
+@app.post("/api/report-views")
+def save_report_view(payload: ReportViewInput, user=Depends(require("analyst"))):
+    allowed = {"dimension", "metric", "chart", "filters"}
+    if not payload.name.strip():
+        raise HTTPException(400, "Report view name cannot be blank")
+    if set(payload.config) - allowed:
+        raise HTTPException(400, "Report view contains unsupported settings")
+    choices = {"dimension": {"date", "workflow", "approval_status"},
+               "metric": {"runs", "matched", "exceptions", "match_rate", "confidence", "variance"},
+               "chart": {"line", "bar"}}
+    for field, values in choices.items():
+        if field in payload.config and (not isinstance(payload.config[field], str) or payload.config[field] not in values):
+            raise HTTPException(400, f"Unsupported report {field}")
+    filters = payload.config.get("filters", {})
+    if not isinstance(filters, dict) or set(filters) - {"date_from", "date_to", "workflow_id", "approval_status"}:
+        raise HTTPException(400, "Report view contains unsupported filters")
+    with connect() as db:
+        db.execute("INSERT INTO report_views(user_id,name,config_json) VALUES(?,?,?) ON CONFLICT(user_id,name) DO UPDATE SET config_json=excluded.config_json,updated_at=CURRENT_TIMESTAMP",
+                   (user["id"], payload.name.strip(), json.dumps(payload.config)))
+        row = db.execute("SELECT id,name,config_json,created_at,updated_at FROM report_views WHERE user_id=? AND name=?", (user["id"], payload.name.strip())).fetchone()
+        audit(db, user["id"], "save_report_view", "report_view", row["id"])
+    return {**dict(row), "config": json.loads(row["config_json"])}
+
+@app.delete("/api/report-views/{view_id}")
+def delete_report_view(view_id: int, user=Depends(require("analyst"))):
+    with connect() as db:
+        cur = db.execute("DELETE FROM report_views WHERE id=? AND user_id=?", (view_id, user["id"]))
+        if not cur.rowcount:
+            raise HTTPException(404, "Saved report view not found")
+        audit(db, user["id"], "delete_report_view", "report_view", view_id)
+    return {"ok": True}
 
 @app.get("/api/reports/export.csv")
 def export_report(date_from: str | None = None, date_to: str | None = None,
