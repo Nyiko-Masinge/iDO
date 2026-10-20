@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import hashlib
 import io
@@ -7,15 +8,15 @@ import re
 import secrets
 import zipfile
 from decimal import Decimal
-from datetime import date, datetime
-from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta, timezone
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .database import connect, init_db
+from .database import DATA_DIR, connect, init_db
 from .reconcile import normalize, number, reconcile
 from .security import password_hash, password_ok
 
@@ -36,7 +37,13 @@ async def lifespan(app):
             db.execute("INSERT INTO users(username,password_hash,role) VALUES(?,?, 'admin')", ("admin", password_hash(initial)))
             if not configured_password:
                 print(f"iDO bootstrap administrator password (save it now): {initial}")
-    yield
+    worker = asyncio.create_task(automation_worker())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
 
 app = FastAPI(title="iDO Reconciliation Platform", version="0.1.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="ido/static"), name="static")
@@ -82,6 +89,17 @@ class WorkflowInput(BaseModel):
 class ReportViewInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     config: dict = Field(default_factory=dict)
+
+class AutomationScheduleInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    workflow_id: int = Field(ge=1)
+    left_dataset_id: int = Field(ge=1)
+    right_dataset_id: int = Field(ge=1)
+    cadence: str
+    approval_required: bool = True
+
+class AutomationScheduleStatus(BaseModel):
+    enabled: bool
 
 def current_user(authorization: str | None = Header(default=None)):
     if not authorization or not authorization.startswith("Bearer "):
@@ -255,6 +273,193 @@ def create_run(payload: RunInput, user=Depends(require("analyst"))):
                        (run_id, item["left_index"], item["right_index"], item["status"], item["score"], item["explanation"], json.dumps(item["left"]) if item["left"] is not None else None, json.dumps(item["right"]) if item["right"] is not None else None))
         audit(db, user["id"], "run_reconciliation", "run", run_id, {"result_count": len(results)})
         return {"id": run_id, "name": payload.name, "status": "completed", "result_count": len(results)}
+
+def automation_time(value=None):
+    value = value or datetime.now(timezone.utc)
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+def next_automation_time(cadence, from_time=None):
+    delta = timedelta(days=1 if cadence == "daily" else 7)
+    value = from_time or datetime.now(timezone.utc)
+    return automation_time(value + delta)
+
+def create_automation_report(run_id, execution_id):
+    with connect() as db:
+        rows = db.execute("SELECT status,score,explanation,left_json,right_json FROM results WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["status", "score", "explanation", "left_record_json", "right_record_json"])
+    for row in rows:
+        writer.writerow([row["status"], row["score"], row["explanation"], row["left_json"] or "", row["right_json"] or ""])
+    folder = DATA_DIR / "automation_reports"
+    folder.mkdir(parents=True, exist_ok=True)
+    filename = f"execution-{execution_id}.csv"
+    (folder / filename).write_text(output.getvalue(), encoding="utf-8-sig", newline="")
+    return filename
+
+def run_automation_schedule(schedule_id, trigger_type="scheduled", triggered_by=None):
+    with connect() as db:
+        schedule = db.execute("SELECT * FROM automation_schedules WHERE id=?", (schedule_id,)).fetchone()
+        if not schedule:
+            return {"status": "failed", "message": "Schedule not found"}
+        owner_id = schedule["owner_id"]
+        cur = db.execute("INSERT INTO automation_executions(schedule_id,triggered_by,trigger_type,status) VALUES(?,?,?,'running')",
+                         (schedule_id, triggered_by or owner_id, trigger_type))
+        execution_id = cur.lastrowid
+        if trigger_type == "scheduled":
+            db.execute("UPDATE automation_schedules SET last_run_at=?,next_run_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (automation_time(), next_automation_time(schedule["cadence"]), schedule_id))
+    run_id = None
+    try:
+        with connect() as db:
+            schedule = db.execute("SELECT * FROM automation_schedules WHERE id=?", (schedule_id,)).fetchone()
+            workflow = db.execute("SELECT config_json,name FROM workflow_templates WHERE id=?", (schedule["workflow_id"],)).fetchone()
+            left = db.execute("SELECT * FROM datasets WHERE id=?", (schedule["left_dataset_id"],)).fetchone()
+            right = db.execute("SELECT * FROM datasets WHERE id=?", (schedule["right_dataset_id"],)).fetchone()
+            if not workflow or not left or not right:
+                raise ValueError("A selected workflow or dataset is no longer available")
+            owner = db.execute("SELECT active FROM users WHERE id=?", (owner_id,)).fetchone()
+            if not owner or not owner["active"]:
+                raise ValueError("Schedule owner is inactive")
+            config = json.loads(workflow["config_json"])
+            mappings = config.get("key_mappings", [])
+            left_columns, right_columns = json.loads(left["columns_json"]), json.loads(right["columns_json"])
+            if not mappings or any(m.get("left") not in left_columns or m.get("right") not in right_columns for m in mappings):
+                raise ValueError("Workflow fields do not match the selected datasets")
+            amount_mapping = config.get("amount_mapping")
+            if amount_mapping and (amount_mapping.get("left") not in left_columns or amount_mapping.get("right") not in right_columns):
+                raise ValueError("Workflow amount fields do not match the selected datasets")
+            left_rows, right_rows = json.loads(left["rows_json"]), json.loads(right["rows_json"])
+            config["aliases"] = config.get("aliases", [])
+            results = reconcile(left_rows, right_rows, config)
+            run_name = f"{schedule['name'][:72]} · {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            run_status = "pending_approval" if schedule["approval_required"] else "completed"
+            cur = db.execute("INSERT INTO runs(name,left_dataset_id,right_dataset_id,config_json,workflow_template_id,status,created_by) VALUES(?,?,?,?,?,?,?)",
+                             (run_name, left["id"], right["id"], json.dumps(config), schedule["workflow_id"], run_status, owner_id))
+            run_id = cur.lastrowid
+            for item in results:
+                db.execute("INSERT INTO results(run_id,left_index,right_index,status,score,explanation,left_json,right_json) VALUES(?,?,?,?,?,?,?,?)",
+                           (run_id, item["left_index"], item["right_index"], item["status"], item["score"], item["explanation"], json.dumps(item["left"]) if item["left"] is not None else None, json.dumps(item["right"]) if item["right"] is not None else None))
+            if schedule["approval_required"]:
+                db.execute("INSERT INTO approvals(run_id,requested_by,status) VALUES(?,?,'pending')", (run_id, owner_id))
+            audit(db, triggered_by or owner_id, "automation_run", "run", run_id,
+                  {"schedule_id": schedule_id, "execution_id": execution_id, "trigger_type": trigger_type, "result_count": len(results)})
+        report_file = create_automation_report(run_id, execution_id)
+        with connect() as db:
+            db.execute("UPDATE automation_executions SET run_id=?,status='succeeded',message=?,report_file=?,finished_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (run_id, "Approval requested" if schedule["approval_required"] else "Run completed", report_file, execution_id))
+        return {"id": execution_id, "run_id": run_id, "status": "succeeded", "report_file": report_file}
+    except Exception as exc:
+        message = str(exc)[:1000] or "Automation failed"
+        with connect() as db:
+            db.execute("UPDATE automation_executions SET run_id=?,status='failed',message=?,finished_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (run_id, message, execution_id))
+            audit(db, triggered_by or owner_id, "automation_failed", "automation_execution", execution_id,
+                  {"schedule_id": schedule_id, "message": message})
+        return {"id": execution_id, "run_id": run_id, "status": "failed", "message": message}
+
+def process_due_automation_schedules():
+    now = automation_time()
+    with connect() as db:
+        schedule_ids = [row["id"] for row in db.execute("SELECT id FROM automation_schedules WHERE enabled=1 AND next_run_at<=? ORDER BY next_run_at,id", (now,)).fetchall()]
+    for schedule_id in schedule_ids:
+        run_automation_schedule(schedule_id, "scheduled")
+
+async def automation_worker():
+    while True:
+        try:
+            await asyncio.to_thread(process_due_automation_schedules)
+        except Exception as exc:
+            print(f"iDO automation scheduler cycle failed: {exc}")
+        await asyncio.sleep(20)
+
+@app.get("/api/automation/schedules")
+def automation_schedules(user=Depends(current_user)):
+    with connect() as db:
+        rows = db.execute("""SELECT s.id,s.owner_id,u.username owner_name,s.name,s.workflow_id,w.name workflow_name,
+          s.left_dataset_id,d1.name left_dataset,s.right_dataset_id,d2.name right_dataset,s.cadence,
+          s.approval_required,s.enabled,s.next_run_at,s.last_run_at,s.created_at,s.updated_at,
+          (SELECT status FROM automation_executions e WHERE e.schedule_id=s.id ORDER BY e.id DESC LIMIT 1) last_status
+          FROM automation_schedules s JOIN users u ON u.id=s.owner_id JOIN workflow_templates w ON w.id=s.workflow_id
+          JOIN datasets d1 ON d1.id=s.left_dataset_id JOIN datasets d2 ON d2.id=s.right_dataset_id ORDER BY s.id DESC""").fetchall()
+    return [dict(row) for row in rows]
+
+@app.get("/api/automation/executions")
+def automation_executions(user=Depends(current_user)):
+    with connect() as db:
+        rows = db.execute("""SELECT e.id,e.schedule_id,s.name schedule_name,e.run_id,e.trigger_type,e.status,e.message,
+          e.started_at,e.finished_at,CASE WHEN e.report_file IS NULL THEN 0 ELSE 1 END has_report,
+          r.name run_name,(SELECT COUNT(*) FROM results x WHERE x.run_id=e.run_id AND x.status='matched') matched,
+          (SELECT COUNT(*) FROM results x WHERE x.run_id=e.run_id AND x.status!='matched') exceptions
+          FROM automation_executions e LEFT JOIN automation_schedules s ON s.id=e.schedule_id
+          LEFT JOIN runs r ON r.id=e.run_id ORDER BY e.id DESC LIMIT 100""").fetchall()
+    return [dict(row) for row in rows]
+
+@app.post("/api/automation/schedules")
+def create_automation_schedule(payload: AutomationScheduleInput, user=Depends(require("analyst"))):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(400, "Schedule name cannot be blank")
+    if payload.cadence not in {"daily", "weekly"}:
+        raise HTTPException(400, "Schedule frequency must be daily or weekly")
+    if payload.left_dataset_id == payload.right_dataset_id:
+        raise HTTPException(400, "Choose two different datasets")
+    with connect() as db:
+        workflow = db.execute("SELECT config_json FROM workflow_templates WHERE id=?", (payload.workflow_id,)).fetchone()
+        left = db.execute("SELECT columns_json FROM datasets WHERE id=?", (payload.left_dataset_id,)).fetchone()
+        right = db.execute("SELECT columns_json FROM datasets WHERE id=?", (payload.right_dataset_id,)).fetchone()
+        if not workflow or not left or not right:
+            raise HTTPException(404, "Workflow or dataset not found")
+        config = json.loads(workflow["config_json"])
+        left_columns, right_columns = json.loads(left["columns_json"]), json.loads(right["columns_json"])
+        mappings = config.get("key_mappings", [])
+        amount_mapping = config.get("amount_mapping")
+        if not mappings or any(m.get("left") not in left_columns or m.get("right") not in right_columns for m in mappings):
+            raise HTTPException(400, "The saved workflow fields do not match the selected datasets")
+        if amount_mapping and (amount_mapping.get("left") not in left_columns or amount_mapping.get("right") not in right_columns):
+            raise HTTPException(400, "The saved workflow amount fields do not match the selected datasets")
+        next_run = next_automation_time(payload.cadence)
+        cur = db.execute("INSERT INTO automation_schedules(owner_id,name,workflow_id,left_dataset_id,right_dataset_id,cadence,approval_required,next_run_at) VALUES(?,?,?,?,?,?,?,?)",
+                         (user["id"], name, payload.workflow_id, payload.left_dataset_id, payload.right_dataset_id, payload.cadence, int(payload.approval_required), next_run))
+        audit(db, user["id"], "create_automation_schedule", "automation_schedule", cur.lastrowid,
+              {"cadence": payload.cadence, "workflow_id": payload.workflow_id, "approval_required": payload.approval_required})
+        return {"id": cur.lastrowid, "name": name, "next_run_at": next_run, "enabled": True}
+
+@app.post("/api/automation/schedules/{schedule_id}/run")
+def run_automation_now(schedule_id: int, user=Depends(require("analyst"))):
+    with connect() as db:
+        schedule = db.execute("SELECT owner_id FROM automation_schedules WHERE id=?", (schedule_id,)).fetchone()
+    if not schedule:
+        raise HTTPException(404, "Automation schedule not found")
+    if schedule["owner_id"] != user["id"] and user["role"] != "admin":
+        raise HTTPException(403, "Only the schedule owner or an administrator can run it")
+    return run_automation_schedule(schedule_id, "manual", user["id"])
+
+@app.patch("/api/automation/schedules/{schedule_id}/status")
+def set_automation_status(schedule_id: int, payload: AutomationScheduleStatus, user=Depends(require("analyst"))):
+    with connect() as db:
+        schedule = db.execute("SELECT owner_id,cadence FROM automation_schedules WHERE id=?", (schedule_id,)).fetchone()
+        if not schedule:
+            raise HTTPException(404, "Automation schedule not found")
+        if schedule["owner_id"] != user["id"] and user["role"] != "admin":
+            raise HTTPException(403, "Only the schedule owner or an administrator can change it")
+        next_run = next_automation_time(schedule["cadence"]) if payload.enabled else db.execute("SELECT next_run_at FROM automation_schedules WHERE id=?", (schedule_id,)).fetchone()["next_run_at"]
+        db.execute("UPDATE automation_schedules SET enabled=?,next_run_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (int(payload.enabled), next_run, schedule_id))
+        audit(db, user["id"], "resume_automation_schedule" if payload.enabled else "pause_automation_schedule", "automation_schedule", schedule_id)
+    return {"id": schedule_id, "enabled": payload.enabled, "next_run_at": next_run}
+
+@app.get("/api/automation/executions/{execution_id}/export.csv")
+def download_automation_report(execution_id: int, user=Depends(current_user)):
+    with connect() as db:
+        row = db.execute("SELECT e.report_file,s.owner_id FROM automation_executions e LEFT JOIN automation_schedules s ON s.id=e.schedule_id WHERE e.id=?", (execution_id,)).fetchone()
+    if not row or not row["report_file"]:
+        raise HTTPException(404, "Automation report is not available")
+    if row["owner_id"] != user["id"] and user["role"] != "admin":
+        raise HTTPException(403, "Only the schedule owner or an administrator can download this report")
+    path = DATA_DIR / "automation_reports" / row["report_file"]
+    if not path.is_file():
+        raise HTTPException(404, "Automation report file is missing")
+    return FileResponse(path, media_type="text/csv", filename=f"ido-automation-execution-{execution_id}.csv")
 
 @app.get("/api/workflows")
 def workflows(user=Depends(current_user)):

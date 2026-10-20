@@ -75,6 +75,21 @@ CREATE TABLE IF NOT EXISTS report_views (
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
  UNIQUE(user_id,name)
 );
+CREATE TABLE IF NOT EXISTS automation_schedules (
+ id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES users(id), name TEXT NOT NULL,
+ workflow_id INTEGER NOT NULL REFERENCES workflow_templates(id),
+ left_dataset_id INTEGER NOT NULL REFERENCES datasets(id), right_dataset_id INTEGER NOT NULL REFERENCES datasets(id),
+ cadence TEXT NOT NULL CHECK(cadence IN ('daily','weekly')), approval_required INTEGER NOT NULL DEFAULT 1,
+ enabled INTEGER NOT NULL DEFAULT 1, next_run_at TEXT NOT NULL, last_run_at TEXT,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS automation_executions (
+ id INTEGER PRIMARY KEY, schedule_id INTEGER REFERENCES automation_schedules(id), run_id INTEGER REFERENCES runs(id),
+ triggered_by INTEGER REFERENCES users(id), trigger_type TEXT NOT NULL CHECK(trigger_type IN ('scheduled','manual')),
+ status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')),
+ message TEXT NOT NULL DEFAULT '', report_file TEXT,
+ started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, finished_at TEXT
+);
 """
 
 @contextmanager
