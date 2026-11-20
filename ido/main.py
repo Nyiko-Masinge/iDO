@@ -92,6 +92,15 @@ class NewUser(BaseModel):
     password: str = Field(min_length=12, max_length=200)
     role: str
 
+class UserUpdate(BaseModel):
+    role: str | None = None
+    active: bool | None = None
+
+class PasswordChange(BaseModel):
+    current_password: str = Field(min_length=1, max_length=200)
+    new_password: str = Field(min_length=12, max_length=200)
+    confirm_password: str = Field(min_length=12, max_length=200)
+
 class RunInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     left_dataset_id: int
@@ -136,14 +145,16 @@ class AutomationScheduleInput(BaseModel):
 class AutomationScheduleStatus(BaseModel):
     enabled: bool
 
-def current_user(authorization: str | None = Header(default=None)):
+def current_user(request: Request, authorization: str | None = Header(default=None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Sign in required")
     token_hash = hashlib.sha256(authorization[7:].encode()).hexdigest()
     with connect() as db:
-        row = db.execute(f"SELECT u.id,u.username,u.role,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.created_at>=datetime('now','-{SESSION_MAX_AGE_HOURS} hours')", (token_hash,)).fetchone()
+        row = db.execute(f"SELECT u.id,u.username,u.role,u.active,u.password_reset_required FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.created_at>=datetime('now','-{SESSION_MAX_AGE_HOURS} hours')", (token_hash,)).fetchone()
     if not row or not row["active"]:
         raise HTTPException(401, "Session expired or user disabled")
+    if row["password_reset_required"] and request.url.path not in {"/api/me", "/api/me/password", "/api/logout"}:
+        raise HTTPException(403, "Update your temporary password before continuing")
     return dict(row)
 
 def require(min_role):
@@ -240,7 +251,10 @@ def me(user=Depends(current_user)):
 @app.get("/api/users")
 def users(user=Depends(require("admin"))):
     with connect() as db:
-        return [dict(r) for r in db.execute("SELECT id,username,role,active,created_at FROM users ORDER BY username")]
+        rows = db.execute(f"""SELECT u.id,u.username,u.role,u.active,u.password_reset_required,u.created_at,
+          (SELECT COUNT(*) FROM sessions s WHERE s.user_id=u.id AND s.created_at>=datetime('now','-{SESSION_MAX_AGE_HOURS} hours')) active_sessions
+          FROM users u ORDER BY u.username""").fetchall()
+        return [dict(row) for row in rows]
 
 @app.post("/api/users")
 def create_user(payload: NewUser, user=Depends(require("admin"))):
@@ -248,13 +262,90 @@ def create_user(payload: NewUser, user=Depends(require("admin"))):
         raise HTTPException(400, "Unsupported role")
     with connect() as db:
         try:
-            cur = db.execute("INSERT INTO users(username,password_hash,role) VALUES(?,?,?)", (payload.username, password_hash(payload.password), payload.role))
+            cur = db.execute("INSERT INTO users(username,password_hash,role,password_reset_required) VALUES(?,?,?,1)", (payload.username, password_hash(payload.password), payload.role))
         except Exception as exc:
             if "UNIQUE" in str(exc):
                 raise HTTPException(409, "Username already exists")
             raise
         audit(db, user["id"], "create_user", "user", cur.lastrowid, {"role": payload.role})
-        return {"id": cur.lastrowid, "username": payload.username, "role": payload.role}
+        return {"id": cur.lastrowid, "username": payload.username, "role": payload.role, "password_reset_required": True}
+
+@app.patch("/api/users/{user_id}")
+def update_user(user_id: int, payload: UserUpdate, user=Depends(require("admin"))):
+    if payload.role is None and payload.active is None:
+        raise HTTPException(400, "Choose a role or account status to update")
+    if payload.role is not None and payload.role not in ROLES:
+        raise HTTPException(400, "Unsupported role")
+    if user_id == user["id"] and (payload.active is False or (payload.role is not None and payload.role != "admin")):
+        raise HTTPException(400, "You cannot deactivate or remove your own administrator access")
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        target = db.execute("SELECT id,username,role,active FROM users WHERE id=?", (user_id,)).fetchone()
+        if not target:
+            raise HTTPException(404, "User not found")
+        next_role = payload.role if payload.role is not None else target["role"]
+        next_active = int(payload.active) if payload.active is not None else target["active"]
+        if target["role"] == "admin" and target["active"] and (next_role != "admin" or not next_active):
+            active_admins = db.execute("SELECT COUNT(*) count FROM users WHERE role='admin' AND active=1").fetchone()["count"]
+            if active_admins <= 1:
+                raise HTTPException(409, "The last active administrator cannot be demoted or deactivated")
+        role_changed = next_role != target["role"]
+        deactivated = bool(target["active"] and not next_active)
+        db.execute("UPDATE users SET role=?,active=? WHERE id=?", (next_role, next_active, user_id))
+        revoked = 0
+        if role_changed or deactivated:
+            revoked = db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,)).rowcount
+        audit(db, user["id"], "update_user_access", "user", user_id,
+              {"role": next_role, "active": bool(next_active), "sessions_revoked": revoked})
+    return {"id": user_id, "role": next_role, "active": bool(next_active), "sessions_revoked": revoked}
+
+@app.post("/api/users/{user_id}/password-reset")
+def reset_user_password(user_id: int, user=Depends(require("admin"))):
+    if user_id == user["id"]:
+        raise HTTPException(400, "Use the Change password form to update your own password")
+    temporary_password = secrets.token_urlsafe(18)
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        target = db.execute("SELECT id,username,active FROM users WHERE id=?", (user_id,)).fetchone()
+        if not target:
+            raise HTTPException(404, "User not found")
+        db.execute("UPDATE users SET password_hash=?,password_reset_required=1 WHERE id=?",
+                   (password_hash(temporary_password), user_id))
+        revoked = db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,)).rowcount
+        audit(db, user["id"], "reset_user_password", "user", user_id,
+              {"sessions_revoked": revoked, "password_change_required": True})
+    return {"id": user_id, "username": target["username"], "temporary_password": temporary_password,
+            "password_reset_required": True, "sessions_revoked": revoked}
+
+@app.post("/api/users/{user_id}/sessions/revoke")
+def revoke_user_sessions(user_id: int, authorization: str = Header(), user=Depends(require("admin"))):
+    token_hash = hashlib.sha256(authorization[7:].encode()).hexdigest()
+    with connect() as db:
+        target = db.execute("SELECT id,username FROM users WHERE id=?", (user_id,)).fetchone()
+        if not target:
+            raise HTTPException(404, "User not found")
+        if user_id == user["id"]:
+            revoked = db.execute("DELETE FROM sessions WHERE user_id=? AND token_hash<>?", (user_id, token_hash)).rowcount
+        else:
+            revoked = db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,)).rowcount
+        audit(db, user["id"], "revoke_user_sessions", "user", user_id, {"sessions_revoked": revoked})
+    return {"id": user_id, "sessions_revoked": revoked, "current_session_preserved": user_id == user["id"]}
+
+@app.post("/api/me/password")
+def change_password(payload: PasswordChange, user=Depends(current_user)):
+    if payload.new_password != payload.confirm_password:
+        raise HTTPException(400, "New password confirmation does not match")
+    with connect() as db:
+        account = db.execute("SELECT password_hash FROM users WHERE id=? AND active=1", (user["id"],)).fetchone()
+        if not account or not password_ok(payload.current_password, account["password_hash"]):
+            raise HTTPException(400, "Current password is incorrect")
+        if password_ok(payload.new_password, account["password_hash"]):
+            raise HTTPException(400, "Choose a password you have not used for the current password")
+        db.execute("UPDATE users SET password_hash=?,password_reset_required=0 WHERE id=?",
+                   (password_hash(payload.new_password), user["id"]))
+        revoked = db.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],)).rowcount
+        audit(db, user["id"], "change_password", "user", user["id"], {"sessions_revoked": revoked})
+    return {"ok": True, "sessions_revoked": revoked, "sign_in_again": True}
 
 @app.post("/api/datasets")
 async def upload_dataset(name: str, file: UploadFile = File(...), user=Depends(require("analyst"))):
