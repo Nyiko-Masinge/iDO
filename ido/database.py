@@ -4,7 +4,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 DATA_DIR = Path(os.getenv("IDO_DATA_DIR", "data")).resolve()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+try:
+    DATA_DIR.chmod(0o700)
+except OSError:
+    pass  # Windows permissions are inherited from the directory ACL.
 DB_PATH = DATA_DIR / "ido.sqlite3"
 
 SCHEMA = """
@@ -17,6 +21,11 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
  token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS login_attempts (
+ attempt_key TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0,
+ window_started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ locked_until TEXT
 );
 CREATE TABLE IF NOT EXISTS datasets (
  id INTEGER PRIMARY KEY, name TEXT NOT NULL, source_name TEXT NOT NULL, owner_id INTEGER NOT NULL REFERENCES users(id),
@@ -97,6 +106,7 @@ def connect():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
         conn.commit()
@@ -107,8 +117,17 @@ def connect():
         conn.close()
 
 def init_db():
+    # WAL improves read/write concurrency for the local scheduler and UI.
+    with sqlite3.connect(DB_PATH, timeout=5) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
     with connect() as db:
         db.executescript(SCHEMA)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_created ON sessions(user_id, created_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_attempts_window ON login_attempts(window_started_at)")
         run_columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
         if "workflow_template_id" not in run_columns:
             db.execute("ALTER TABLE runs ADD COLUMN workflow_template_id INTEGER REFERENCES workflow_templates(id)")
+    try:
+        DB_PATH.chmod(0o600)
+    except OSError:
+        pass  # Windows permissions are inherited from the directory ACL.

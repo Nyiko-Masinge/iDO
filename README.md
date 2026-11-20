@@ -21,6 +21,8 @@ uvicorn ido.main:app --reload
 
 Open http://127.0.0.1:8000. On first start, iDO creates the local database and an `admin` user. The bootstrap password is read only when that account does not already exist; if the environment variable is unset, a generated password is printed in the server console. Database and uploaded files default to `./data` and can be relocated with `IDO_DATA_DIR`.
 
+Keep the server bound to localhost for this local build. Do not expose it to a LAN or the public internet: production use still needs HTTPS, managed secrets, MFA, deployment-level request limits, monitored backups, retention controls, and an independent security review.
+
 If you lose a local user's password, stop the server and run `python -m ido.reset_admin` from this project directory. It prompts securely for the new password, invalidates that user's sessions, and keeps datasets and workflows.
 
 ## First workflow
@@ -51,3 +53,13 @@ Reviewers can confirm matches, flag false matches, confirm exceptions, and recor
 - `ido/static/`: local web interface.
 
 This is an initial implementation foundation, not yet a production deployment. Before handling sensitive or regulated financial data, add HTTPS and managed secrets for the target environment, retention controls, operational backups, and security review.
+
+## Local security controls
+
+- Passwords are PBKDF2 hashed; bearer sessions expire after 12 hours and are revoked on sign-out or password reset.
+- Sign-in attempts are throttled after 10 failures for the same account and client address within a 15-minute window.
+- Uploads are limited to 25 MB, 100,000 rows, 500 columns, 2,000,000 cells, and 100,000 characters per cell. XLSX archives are checked for oversized expansion before parsing.
+- CSV exports neutralize spreadsheet formula prefixes. The local data directory and SQLite database use restrictive permissions where the operating system supports them.
+- API responses are marked non-cacheable; security headers prevent framing, MIME sniffing, and unnecessary browser capabilities. The UI script is allowed through a content hash, generated controls use delegated click handling, and interactive API documentation is disabled.
+
+These controls reduce common local risks; they do not make an application impossible to compromise. The current single-workspace SQLite design is intended for local evaluation and a controlled pilot, not yet for production financial data or internet-facing multi-tenant service.
