@@ -103,6 +103,9 @@ class RunInput(BaseModel):
     amount_field: str | None = None
     tolerance: float = Field(default=0, ge=0)
     workflow_template_id: int | None = Field(default=None, ge=1)
+    date_window: dict | None = None
+    duplicate_detection: bool = True
+    partial_matching: dict = Field(default_factory=dict)
 
 class ApprovalDecision(BaseModel):
     decision: str
@@ -120,6 +123,9 @@ class WorkflowInput(BaseModel):
     key_mappings: list[dict[str, str]] = Field(default_factory=list)
     amount_mapping: dict[str, str] | None = None
     tolerance: float = Field(default=0, ge=0)
+    date_window: dict | None = None
+    duplicate_detection: bool = True
+    partial_matching: dict = Field(default_factory=dict)
 
 class ReportViewInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
@@ -387,6 +393,23 @@ def create_run(payload: RunInput, user=Depends(require("analyst"))):
             raise HTTPException(400, "Every mapped field must exist in its selected dataset")
         if amount_mapping and (amount_mapping.get("left") not in left_cols or amount_mapping.get("right") not in right_cols):
             raise HTTPException(400, "Amount mapping fields must exist in their selected datasets")
+        date_window = payload.date_window or {}
+        if date_window and (date_window.get("left") not in left_cols or date_window.get("right") not in right_cols):
+            raise HTTPException(400, "Date window fields must exist in their selected datasets")
+        try:
+            window_days = int(date_window.get("days", 0)) if date_window else 0
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Date window must be a whole number of days")
+        if not 0 <= window_days <= 365:
+            raise HTTPException(400, "Date window must be between 0 and 365 days")
+        partial_matching = payload.partial_matching or {"enabled": False, "minimum_key_ratio": 0.75}
+        try:
+            partial_ratio = float(partial_matching.get("minimum_key_ratio", 0.75))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Partial match threshold must be a number")
+        if not 0.5 <= partial_ratio <= 1:
+            raise HTTPException(400, "Partial match threshold must be between 50% and 100%")
+        partial_matching = {"enabled": bool(partial_matching.get("enabled")), "minimum_key_ratio": partial_ratio}
         aliases = []
         if payload.workflow_template_id:
             template = db.execute("SELECT config_json FROM workflow_templates WHERE id=?", (payload.workflow_template_id,)).fetchone()
@@ -396,14 +419,16 @@ def create_run(payload: RunInput, user=Depends(require("analyst"))):
             if mappings != template_config.get("key_mappings", []):
                 raise HTTPException(400, "Selected field mappings differ from the chosen workflow template")
             aliases = template_config.get("aliases", [])
-        config = {"key_mappings": mappings, "amount_mapping": amount_mapping, "tolerance": payload.tolerance, "aliases": aliases}
+        config = {"key_mappings": mappings, "amount_mapping": amount_mapping, "tolerance": payload.tolerance,
+                  "date_window": ({"left": date_window["left"], "right": date_window["right"], "days": window_days} if date_window else {}),
+                  "duplicate_detection": payload.duplicate_detection, "partial_matching": partial_matching, "aliases": aliases}
         cur = db.execute("INSERT INTO runs(name,left_dataset_id,right_dataset_id,config_json,workflow_template_id,status,created_by) VALUES(?,?,?,?,?,?,?)",
                          (payload.name, left["id"], right["id"], json.dumps(config), payload.workflow_template_id, "completed", user["id"]))
         run_id = cur.lastrowid
         results = reconcile(left_rows, right_rows, config)
         for item in results:
-            db.execute("INSERT INTO results(run_id,left_index,right_index,status,score,explanation,left_json,right_json) VALUES(?,?,?,?,?,?,?,?)",
-                       (run_id, item["left_index"], item["right_index"], item["status"], item["score"], item["explanation"], json.dumps(item["left"]) if item["left"] is not None else None, json.dumps(item["right"]) if item["right"] is not None else None))
+            db.execute("INSERT INTO results(run_id,left_index,right_index,status,score,explanation,left_json,right_json,exception_category) VALUES(?,?,?,?,?,?,?,?,?)",
+                       (run_id, item["left_index"], item["right_index"], item["status"], item["score"], item["explanation"], json.dumps(item["left"]) if item["left"] is not None else None, json.dumps(item["right"]) if item["right"] is not None else None, item.get("exception_category")))
         audit(db, user["id"], "run_reconciliation", "run", run_id, {"result_count": len(results)})
         return {"id": run_id, "name": payload.name, "status": "completed", "result_count": len(results)}
 
@@ -418,12 +443,12 @@ def next_automation_time(cadence, from_time=None):
 
 def create_automation_report(run_id, execution_id):
     with connect() as db:
-        rows = db.execute("SELECT status,score,explanation,left_json,right_json FROM results WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
+        rows = db.execute("SELECT status,score,exception_category,explanation,left_json,right_json FROM results WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    write_csv_row(writer, ["status", "score", "explanation", "left_record_json", "right_record_json"])
+    write_csv_row(writer, ["status", "score", "exception_category", "explanation", "left_record_json", "right_record_json"])
     for row in rows:
-        write_csv_row(writer, [row["status"], row["score"], row["explanation"], row["left_json"] or "", row["right_json"] or ""])
+        write_csv_row(writer, [row["status"], row["score"], row["exception_category"] or "", row["explanation"], row["left_json"] or "", row["right_json"] or ""])
     folder = DATA_DIR / "automation_reports"
     folder.mkdir(parents=True, exist_ok=True)
     filename = f"execution-{execution_id}.csv"
@@ -467,6 +492,9 @@ def run_automation_schedule(schedule_id, trigger_type="scheduled", triggered_by=
             amount_mapping = config.get("amount_mapping")
             if amount_mapping and (amount_mapping.get("left") not in left_columns or amount_mapping.get("right") not in right_columns):
                 raise ValueError("Workflow amount fields do not match the selected datasets")
+            date_window = config.get("date_window") or {}
+            if date_window and (date_window.get("left") not in left_columns or date_window.get("right") not in right_columns):
+                raise ValueError("Workflow date fields do not match the selected datasets")
             left_rows, right_rows = json.loads(left["rows_json"]), json.loads(right["rows_json"])
             config["aliases"] = config.get("aliases", [])
             results = reconcile(left_rows, right_rows, config)
@@ -476,8 +504,8 @@ def run_automation_schedule(schedule_id, trigger_type="scheduled", triggered_by=
                              (run_name, left["id"], right["id"], json.dumps(config), schedule["workflow_id"], run_status, owner_id))
             run_id = cur.lastrowid
             for item in results:
-                db.execute("INSERT INTO results(run_id,left_index,right_index,status,score,explanation,left_json,right_json) VALUES(?,?,?,?,?,?,?,?)",
-                           (run_id, item["left_index"], item["right_index"], item["status"], item["score"], item["explanation"], json.dumps(item["left"]) if item["left"] is not None else None, json.dumps(item["right"]) if item["right"] is not None else None))
+                db.execute("INSERT INTO results(run_id,left_index,right_index,status,score,explanation,left_json,right_json,exception_category) VALUES(?,?,?,?,?,?,?,?,?)",
+                           (run_id, item["left_index"], item["right_index"], item["status"], item["score"], item["explanation"], json.dumps(item["left"]) if item["left"] is not None else None, json.dumps(item["right"]) if item["right"] is not None else None, item.get("exception_category")))
             if schedule["approval_required"]:
                 db.execute("INSERT INTO approvals(run_id,requested_by,status) VALUES(?,?,'pending')", (run_id, owner_id))
             audit(db, triggered_by or owner_id, "automation_run", "run", run_id,
@@ -613,7 +641,23 @@ def save_workflow(payload: WorkflowInput, user=Depends(require("analyst"))):
         raise HTTPException(400, "A workflow needs at least one key mapping")
     if any(not item.get("left") or not item.get("right") for item in payload.key_mappings):
         raise HTTPException(400, "Each mapping needs left and right fields")
-    config = {"key_mappings": payload.key_mappings, "amount_mapping": payload.amount_mapping, "tolerance": payload.tolerance}
+    date_window = payload.date_window or {}
+    if date_window and (not date_window.get("left") or not date_window.get("right")):
+        raise HTTPException(400, "Choose both date fields or leave the date window blank")
+    try:
+        window_days = int(date_window.get("days", 0)) if date_window else 0
+        partial_ratio = float((payload.partial_matching or {}).get("minimum_key_ratio", 0.75))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Workflow date window and partial-match threshold must be numeric")
+    if not 0 <= window_days <= 365:
+        raise HTTPException(400, "Date window must be between 0 and 365 days")
+    if not 0.5 <= partial_ratio <= 1:
+        raise HTTPException(400, "Partial match threshold must be between 50% and 100%")
+    normalized_date_window = ({"left": date_window["left"], "right": date_window["right"], "days": window_days} if date_window else {})
+    normalized_partial = {"enabled": bool((payload.partial_matching or {}).get("enabled")), "minimum_key_ratio": partial_ratio}
+    config = {"key_mappings": payload.key_mappings, "amount_mapping": payload.amount_mapping, "tolerance": payload.tolerance,
+              "date_window": normalized_date_window, "duplicate_detection": payload.duplicate_detection,
+              "partial_matching": normalized_partial}
     with connect() as db:
         cur = db.execute("INSERT INTO workflow_templates(name,description,config_json,created_by) VALUES(?,?,?,?)",
                          (payload.name, payload.description, json.dumps(config), user["id"]))
@@ -794,15 +838,15 @@ def export_report_exceptions(date_from: str | None = None, date_to: str | None =
     ids = [run["id"] for run in report["runs"]]
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    write_csv_row(writer, ["run_id", "run_name", "created_at", "approval_status", "exception_type", "left_record", "right_record", "explanation"])
+    write_csv_row(writer, ["run_id", "run_name", "created_at", "approval_status", "exception_type", "exception_category", "left_record", "right_record", "explanation"])
     if ids:
         with connect() as db:
             for offset in range(0, len(ids), 500):
                 chunk = ids[offset:offset + 500]
                 placeholders = ",".join("?" for _ in chunk)
-                rows = db.execute(f"SELECT r.id,r.name,r.created_at,a.status approval_status,x.status exception_type,x.left_json,x.right_json,x.explanation FROM results x JOIN runs r ON r.id=x.run_id LEFT JOIN approvals a ON a.run_id=r.id WHERE x.run_id IN ({placeholders}) AND x.status!='matched' ORDER BY r.id DESC,x.id", chunk).fetchall()
+                rows = db.execute(f"SELECT r.id,r.name,r.created_at,a.status approval_status,x.status exception_type,x.exception_category,x.left_json,x.right_json,x.explanation FROM results x JOIN runs r ON r.id=x.run_id LEFT JOIN approvals a ON a.run_id=r.id WHERE x.run_id IN ({placeholders}) AND (x.status!='matched' OR x.exception_category IS NOT NULL) ORDER BY r.id DESC,x.id", chunk).fetchall()
                 for row in rows:
-                    write_csv_row(writer, [row["id"], row["name"], row["created_at"], row["approval_status"] or "not_requested", row["exception_type"], row["left_json"] or "", row["right_json"] or "", row["explanation"]])
+                    write_csv_row(writer, [row["id"], row["name"], row["created_at"], row["approval_status"] or "not_requested", row["exception_type"], row["exception_category"] or "", row["left_json"] or "", row["right_json"] or "", row["explanation"]])
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="ido-reconciliation-exceptions.csv"'})
 
 @app.get("/api/runs/{run_id}/export.csv")
@@ -811,12 +855,12 @@ def export_run(run_id: int, user=Depends(current_user)):
         run = db.execute("SELECT name FROM runs WHERE id=?", (run_id,)).fetchone()
         if not run:
             raise HTTPException(404, "Run not found")
-        rows = db.execute("SELECT status,score,explanation,left_json,right_json FROM results WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
+        rows = db.execute("SELECT status,score,exception_category,explanation,left_json,right_json FROM results WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    write_csv_row(writer, ["status", "score", "explanation", "left_record_json", "right_record_json"])
+    write_csv_row(writer, ["status", "score", "exception_category", "explanation", "left_record_json", "right_record_json"])
     for row in rows:
-        write_csv_row(writer, [row["status"], row["score"], row["explanation"], row["left_json"] or "", row["right_json"] or ""])
+        write_csv_row(writer, [row["status"], row["score"], row["exception_category"] or "", row["explanation"], row["left_json"] or "", row["right_json"] or ""])
     safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in run["name"])[:80]
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="ido-run-{run_id}-{safe_name}.csv"'})
 
