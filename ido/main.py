@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import csv
 import hashlib
 import io
@@ -11,7 +12,7 @@ from decimal import Decimal
 from datetime import date, datetime, timedelta, timezone
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -19,9 +20,28 @@ from pydantic import BaseModel, Field
 from .database import DATA_DIR, connect, init_db
 from .reconcile import normalize, number, reconcile
 from .security import password_hash, password_ok
+from pathlib import Path
 
 ROLES = {"admin", "approver", "analyst", "viewer"}
 ROLE_RANK = {"viewer": 0, "analyst": 1, "approver": 2, "admin": 3}
+SESSION_MAX_AGE_HOURS = 12
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_IMPORT_ROWS = 100_000
+MAX_IMPORT_COLUMNS = 500
+MAX_IMPORT_CELLS = 2_000_000
+MAX_IMPORT_CELL_CHARS = 100_000
+MAX_XLSX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+def inline_script_csp_hash():
+    page = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    match = re.search(r"<script>(.*?)</script>", page, re.DOTALL)
+    if not match:
+        return "'none'"
+    digest = hashlib.sha256(match.group(1).encode("utf-8")).digest()
+    return "'sha256-" + base64.b64encode(digest).decode("ascii") + "'"
+
+SCRIPT_CSP_HASH = inline_script_csp_hash()
 
 def audit(db, actor, action, entity, entity_id=None, details=None):
     db.execute("INSERT INTO audit_log(actor_id,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?)",
@@ -31,6 +51,8 @@ def audit(db, actor, action, entity, entity_id=None, details=None):
 async def lifespan(app):
     init_db()
     with connect() as db:
+        db.execute(f"DELETE FROM sessions WHERE created_at < datetime('now', '-{SESSION_MAX_AGE_HOURS} hours')")
+        db.execute("DELETE FROM login_attempts WHERE window_started_at < datetime('now', '-1 day') AND (locked_until IS NULL OR locked_until < datetime('now'))")
         if not db.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
             configured_password = os.getenv("IDO_BOOTSTRAP_ADMIN_PASSWORD")
             initial = configured_password or secrets.token_urlsafe(18)
@@ -45,12 +67,25 @@ async def lifespan(app):
         with suppress(asyncio.CancelledError):
             await worker
 
-app = FastAPI(title="iDO Reconciliation Platform", version="0.1.0", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="ido/static"), name="static")
+app = FastAPI(title="iDO Reconciliation Platform", version="0.1.0", lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Content-Security-Policy", f"default-src 'self'; script-src 'self' {SCRIPT_CSP_HASH}; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 class Login(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=80)
+    password: str = Field(min_length=1, max_length=200)
 
 class NewUser(BaseModel):
     username: str = Field(min_length=3, max_length=80, pattern=r"^[a-zA-Z0-9_.@-]+$")
@@ -71,7 +106,7 @@ class RunInput(BaseModel):
 
 class ApprovalDecision(BaseModel):
     decision: str
-    comment: str = ""
+    comment: str = Field(default="", max_length=1000)
 
 class ResultFeedback(BaseModel):
     verdict: str
@@ -106,7 +141,7 @@ def current_user(authorization: str | None = Header(default=None)):
         raise HTTPException(401, "Sign in required")
     token_hash = hashlib.sha256(authorization[7:].encode()).hexdigest()
     with connect() as db:
-        row = db.execute("SELECT u.id,u.username,u.role,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?", (token_hash,)).fetchone()
+        row = db.execute(f"SELECT u.id,u.username,u.role,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.created_at>=datetime('now','-{SESSION_MAX_AGE_HOURS} hours')", (token_hash,)).fetchone()
     if not row or not row["active"]:
         raise HTTPException(401, "Session expired or user disabled")
     return dict(row)
@@ -120,22 +155,76 @@ def require(min_role):
 
 @app.get("/")
 def home():
-    return FileResponse("ido/static/index.html")
+    return FileResponse(STATIC_DIR / "index.html")
+
+def validate_xlsx_archive(raw):
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            members = archive.infolist()
+            if not members or len(members) > 10_000:
+                raise ValueError("Spreadsheet archive has an invalid number of files")
+            expanded = 0
+            for member in members:
+                expanded += member.file_size
+                if expanded > MAX_XLSX_UNCOMPRESSED_BYTES:
+                    raise ValueError("Spreadsheet expands beyond the 100 MB processing limit")
+                if member.file_size > 1_000_000 and member.compress_size and member.file_size / member.compress_size > 100:
+                    raise ValueError("Spreadsheet compression ratio exceeds the safe limit")
+                if member.flag_bits & 0x1:
+                    raise ValueError("Encrypted spreadsheets are not supported")
+            if "[Content_Types].xml" not in archive.namelist() or "xl/workbook.xml" not in archive.namelist():
+                raise ValueError("File is not a valid XLSX workbook")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("File is not a valid XLSX workbook") from exc
+
+def csv_safe(value):
+    """Neutralize spreadsheet formula prefixes while preserving ordinary numeric values."""
+    if not isinstance(value, str):
+        return value
+    probe = value.lstrip(" \t\r\n")
+    if probe.startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + value
+    return value
+
+def write_csv_row(writer, values):
+    writer.writerow([csv_safe(value) for value in values])
 
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "ido"}
 
+def login_attempt_key(client_ip, username):
+    # Persist only a digest, not the source address or username used by the throttle.
+    value = f"{client_ip or 'unknown'}\0{username.casefold()}".encode("utf-8", "replace")
+    return hashlib.sha256(value).hexdigest()
+
 @app.post("/api/login")
-def login(payload: Login):
+def login(payload: Login, request: Request):
+    attempt_key = login_attempt_key(request.client.host if request.client else None, payload.username)
+    invalid = False
     with connect() as db:
+        lock = db.execute("SELECT locked_until,locked_until>datetime('now') is_locked FROM login_attempts WHERE attempt_key=?", (attempt_key,)).fetchone()
+        if lock and lock["is_locked"]:
+            raise HTTPException(429, "Too many sign-in attempts. Try again in 15 minutes.", headers={"Retry-After": "900"})
         user = db.execute("SELECT * FROM users WHERE username=? AND active=1", (payload.username,)).fetchone()
-        if not user or not password_ok(payload.password, user["password_hash"]):
-            raise HTTPException(401, "Invalid username or password")
-        token = secrets.token_urlsafe(36)
-        db.execute("INSERT INTO sessions(token_hash,user_id) VALUES(?,?)", (hashlib.sha256(token.encode()).hexdigest(), user["id"]))
-        audit(db, user["id"], "sign_in", "user", user["id"])
-        return {"token": token, "user": {"id": user["id"], "username": user["username"], "role": user["role"]}}
+        # Verify a dummy hash for unknown accounts to reduce username timing leaks.
+        valid = password_ok(payload.password, user["password_hash"] if user else "00000000000000000000000000000000$" + "0" * 64)
+        if not user or not valid:
+            db.execute("""INSERT INTO login_attempts(attempt_key,attempts,window_started_at,locked_until)
+              VALUES(?,1,CURRENT_TIMESTAMP,NULL) ON CONFLICT(attempt_key) DO UPDATE SET
+              attempts=CASE WHEN window_started_at<=datetime('now','-15 minutes') THEN 1 ELSE attempts+1 END,
+              window_started_at=CASE WHEN window_started_at<=datetime('now','-15 minutes') THEN CURRENT_TIMESTAMP ELSE window_started_at END,
+              locked_until=CASE WHEN (CASE WHEN window_started_at<=datetime('now','-15 minutes') THEN 1 ELSE attempts+1 END)>=10
+                THEN datetime('now','+15 minutes') ELSE NULL END""", (attempt_key,))
+            invalid = True
+        else:
+            db.execute("DELETE FROM login_attempts WHERE attempt_key=?", (attempt_key,))
+            token = secrets.token_urlsafe(36)
+            db.execute("INSERT INTO sessions(token_hash,user_id) VALUES(?,?)", (hashlib.sha256(token.encode()).hexdigest(), user["id"]))
+            audit(db, user["id"], "sign_in", "user", user["id"])
+    if invalid:
+        raise HTTPException(401, "Invalid username or password")
+    return {"token": token, "user": {"id": user["id"], "username": user["username"], "role": user["role"]}}
 
 @app.post("/api/logout")
 def logout(user=Depends(current_user), authorization: str = Header()):
@@ -171,27 +260,71 @@ def create_user(payload: NewUser, user=Depends(require("admin"))):
 async def upload_dataset(name: str, file: UploadFile = File(...), user=Depends(require("analyst"))):
     if not file.filename or not file.filename.lower().endswith((".csv", ".xlsx")):
         raise HTTPException(400, "Upload a CSV or XLSX file")
-    raw = await file.read(25 * 1024 * 1024 + 1)
-    if len(raw) > 25 * 1024 * 1024:
+    name = name.strip()
+    if not name or len(name) > 120:
+        raise HTTPException(400, "Dataset name must be between 1 and 120 characters")
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    await file.close()
+    if len(raw) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, "File exceeds the 25 MB local upload limit")
     try:
         if file.filename.lower().endswith(".xlsx"):
             from openpyxl import load_workbook
-            workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+            validate_xlsx_archive(raw)
+            workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True, keep_links=False)
             sheet = workbook.active
+            if sheet.max_column and sheet.max_column > MAX_IMPORT_COLUMNS:
+                workbook.close()
+                raise ValueError("Spreadsheet has more than 500 columns")
+            if sheet.max_row and sheet.max_row > MAX_IMPORT_ROWS + 1:
+                workbook.close()
+                raise ValueError("Spreadsheet has more than 100,000 data rows")
             iterator = sheet.iter_rows(values_only=True)
             headers = next(iterator, ())
             columns = [str(value).strip() if value is not None else "" for value in headers]
-            rows = [dict(zip(columns, [value.isoformat() if isinstance(value, (date, datetime)) else value for value in values])) for values in iterator]
-            rows = [{k: (str(v) if v is not None else "") for k, v in row.items()} for row in rows]
-            workbook.close()
+            if len(columns) > MAX_IMPORT_COLUMNS:
+                workbook.close()
+                raise ValueError("Spreadsheet has more than 500 columns")
+            rows = []
+            total_cells = 0
+            try:
+                for values in iterator:
+                    if len(rows) >= MAX_IMPORT_ROWS:
+                        raise ValueError("Spreadsheet has more than 100,000 data rows")
+                    if len(values) > MAX_IMPORT_COLUMNS:
+                        raise ValueError("Spreadsheet has more than 500 columns")
+                    total_cells += len(columns)
+                    if total_cells > MAX_IMPORT_CELLS:
+                        raise ValueError("Spreadsheet exceeds the 2,000,000 cell processing limit")
+                    converted = [value.isoformat() if isinstance(value, (date, datetime)) else value for value in values]
+                    if any(len(str(value)) > MAX_IMPORT_CELL_CHARS for value in converted if value is not None):
+                        raise ValueError("A spreadsheet cell exceeds the 100,000 character limit")
+                    rows.append({k: (str(v) if v is not None else "") for k, v in zip(columns, converted)})
+            finally:
+                workbook.close()
         else:
             text = raw.decode("utf-8-sig")
+            csv.field_size_limit(MAX_IMPORT_CELL_CHARS)
             reader = csv.DictReader(io.StringIO(text))
-            columns = reader.fieldnames or []
-            rows = list(reader)
-    except (UnicodeDecodeError, csv.Error, ValueError, StopIteration, zipfile.BadZipFile) as exc:
-        raise HTTPException(400, f"Unable to read CSV: {exc}")
+            columns = [str(column).strip() if column is not None else "" for column in (reader.fieldnames or [])]
+            if len(columns) > MAX_IMPORT_COLUMNS:
+                raise ValueError("CSV has more than 500 columns")
+            if len({column.casefold() for column in columns}) != len(columns):
+                raise ValueError("Column headers must be unique, ignoring letter case")
+            rows = []
+            total_cells = 0
+            for row in reader:
+                if len(rows) >= MAX_IMPORT_ROWS:
+                    raise ValueError("CSV has more than 100,000 data rows")
+                values = list(row.values())
+                if None in row or len(values) != len(columns) or any(len(value or "") > MAX_IMPORT_CELL_CHARS for value in values if value is not None):
+                    raise ValueError("CSV row has too many fields or a cell exceeds the 100,000 character limit")
+                total_cells += len(columns)
+                if total_cells > MAX_IMPORT_CELLS:
+                    raise ValueError("CSV exceeds the 2,000,000 cell processing limit")
+                rows.append(dict(zip(columns, [value or "" for value in values])))
+    except Exception as exc:
+        raise HTTPException(400, str(exc) if isinstance(exc, ValueError) else "Unable to read CSV or XLSX file")
     if not columns or not rows:
         raise HTTPException(400, "CSV must have a header and at least one data row")
     if any(not column for column in columns) or len({column.casefold() for column in columns}) != len(columns):
@@ -288,13 +421,18 @@ def create_automation_report(run_id, execution_id):
         rows = db.execute("SELECT status,score,explanation,left_json,right_json FROM results WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["status", "score", "explanation", "left_record_json", "right_record_json"])
+    write_csv_row(writer, ["status", "score", "explanation", "left_record_json", "right_record_json"])
     for row in rows:
-        writer.writerow([row["status"], row["score"], row["explanation"], row["left_json"] or "", row["right_json"] or ""])
+        write_csv_row(writer, [row["status"], row["score"], row["explanation"], row["left_json"] or "", row["right_json"] or ""])
     folder = DATA_DIR / "automation_reports"
     folder.mkdir(parents=True, exist_ok=True)
     filename = f"execution-{execution_id}.csv"
-    (folder / filename).write_text(output.getvalue(), encoding="utf-8-sig", newline="")
+    target = folder / filename
+    target.write_text(output.getvalue(), encoding="utf-8-sig", newline="")
+    try:
+        target.chmod(0o600)
+    except OSError:
+        pass  # Windows permissions are managed by the local account ACL.
     return filename
 
 def run_automation_schedule(schedule_id, trigger_type="scheduled", triggered_by=None):
@@ -456,6 +594,8 @@ def download_automation_report(execution_id: int, user=Depends(current_user)):
         raise HTTPException(404, "Automation report is not available")
     if row["owner_id"] != user["id"] and user["role"] != "admin":
         raise HTTPException(403, "Only the schedule owner or an administrator can download this report")
+    if row["report_file"] != f"execution-{execution_id}.csv":
+        raise HTTPException(404, "Automation report is not available")
     path = DATA_DIR / "automation_reports" / row["report_file"]
     if not path.is_file():
         raise HTTPException(404, "Automation report file is missing")
@@ -640,9 +780,9 @@ def export_report(date_from: str | None = None, date_to: str | None = None,
     output = io.StringIO(newline="")
     writer = csv.writer(output)
     fields = ["id", "name", "created_at", "workflow_name", "left_dataset", "right_dataset", "approval_status", "matched", "unmatched_left", "unmatched_right", "exceptions", "total_records", "match_rate", "average_score", "matched_left_amount", "matched_right_amount", "matched_variance", "unmatched_left_amount", "unmatched_right_amount"]
-    writer.writerow(fields)
+    write_csv_row(writer, fields)
     for run in report["runs"]:
-        writer.writerow([run.get(field) for field in fields])
+        write_csv_row(writer, [run.get(field) for field in fields])
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="ido-reconciliation-report.csv"'})
 
 @app.get("/api/reports/exceptions.csv")
@@ -654,7 +794,7 @@ def export_report_exceptions(date_from: str | None = None, date_to: str | None =
     ids = [run["id"] for run in report["runs"]]
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["run_id", "run_name", "created_at", "approval_status", "exception_type", "left_record", "right_record", "explanation"])
+    write_csv_row(writer, ["run_id", "run_name", "created_at", "approval_status", "exception_type", "left_record", "right_record", "explanation"])
     if ids:
         with connect() as db:
             for offset in range(0, len(ids), 500):
@@ -662,7 +802,7 @@ def export_report_exceptions(date_from: str | None = None, date_to: str | None =
                 placeholders = ",".join("?" for _ in chunk)
                 rows = db.execute(f"SELECT r.id,r.name,r.created_at,a.status approval_status,x.status exception_type,x.left_json,x.right_json,x.explanation FROM results x JOIN runs r ON r.id=x.run_id LEFT JOIN approvals a ON a.run_id=r.id WHERE x.run_id IN ({placeholders}) AND x.status!='matched' ORDER BY r.id DESC,x.id", chunk).fetchall()
                 for row in rows:
-                    writer.writerow([row["id"], row["name"], row["created_at"], row["approval_status"] or "not_requested", row["exception_type"], row["left_json"] or "", row["right_json"] or "", row["explanation"]])
+                    write_csv_row(writer, [row["id"], row["name"], row["created_at"], row["approval_status"] or "not_requested", row["exception_type"], row["left_json"] or "", row["right_json"] or "", row["explanation"]])
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="ido-reconciliation-exceptions.csv"'})
 
 @app.get("/api/runs/{run_id}/export.csv")
@@ -674,9 +814,9 @@ def export_run(run_id: int, user=Depends(current_user)):
         rows = db.execute("SELECT status,score,explanation,left_json,right_json FROM results WHERE run_id=? ORDER BY id", (run_id,)).fetchall()
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["status", "score", "explanation", "left_record_json", "right_record_json"])
+    write_csv_row(writer, ["status", "score", "explanation", "left_record_json", "right_record_json"])
     for row in rows:
-        writer.writerow([row["status"], row["score"], row["explanation"], row["left_json"] or "", row["right_json"] or ""])
+        write_csv_row(writer, [row["status"], row["score"], row["explanation"], row["left_json"] or "", row["right_json"] or ""])
     safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in run["name"])[:80]
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="ido-run-{run_id}-{safe_name}.csv"'})
 
