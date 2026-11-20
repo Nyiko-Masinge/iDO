@@ -8,5 +8,12 @@ def password_hash(password, salt=None):
     return f"{salt}${digest}"
 
 def password_ok(password, encoded):
-    salt, _ = encoded.split("$", 1)
-    return hmac.compare_digest(password_hash(password, salt), encoded)
+    try:
+        salt, digest = encoded.split("$", 1)
+        if len(salt) != 32 or len(digest) != 64:
+            return False
+        bytes.fromhex(salt)
+        bytes.fromhex(digest)
+        return hmac.compare_digest(password_hash(password, salt), encoded)
+    except (AttributeError, TypeError, ValueError):
+        return False
