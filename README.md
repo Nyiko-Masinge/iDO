@@ -36,6 +36,12 @@ The generic matcher compares normalized values across mapped fields and optional
 
 The Automation page supports daily and weekly schedules using saved workflows and already imported dataset snapshots. Each schedule can be run immediately or paused, can require approval, and records successful and failed executions. A detailed CSV is generated after each successful run under `data/automation_reports/`. Scheduled runs are checked while the local iDO server is running; they do not import fresh files. New source data still needs to be imported manually.
 
+## Pilot readiness materials
+
+- [Onboarding guide](docs/ONBOARDING_GUIDE.md)
+- [Data handling and retention policy draft](docs/DATA_HANDLING_AND_RETENTION.md)
+- [Controlled pilot plan](docs/PILOT_PLAN.md)
+
 Reviewers can confirm matches, flag false matches, confirm exceptions, and record corrected pairs. These decisions form a persisted evaluation set and contribute to observed reviewed-match precision. A corrected pair can create a scoped alias proposal only when one configured key differs and the remaining mapped keys agree. A different approver must approve the proposal; accepted aliases are applied only to later runs that select the same saved workflow, and remain scoped to the agreeing context fields.
 
 ## Roles

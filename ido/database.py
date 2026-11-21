@@ -15,6 +15,7 @@ SCHEMA = """
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS users (
  id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+ display_name TEXT NOT NULL DEFAULT '',
  role TEXT NOT NULL CHECK(role IN ('admin','approver','analyst','viewer')),
  active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -84,19 +85,30 @@ CREATE TABLE IF NOT EXISTS report_views (
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
  UNIQUE(user_id,name)
 );
+CREATE TABLE IF NOT EXISTS user_preferences (
+ user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+ preferences_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS import_staging (
+ token TEXT PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ name TEXT NOT NULL, source_name TEXT NOT NULL, columns_json TEXT NOT NULL, rows_json TEXT NOT NULL,
+ invalid_rows_json TEXT NOT NULL DEFAULT '[]', invalid_count INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS automation_schedules (
  id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES users(id), name TEXT NOT NULL,
  workflow_id INTEGER NOT NULL REFERENCES workflow_templates(id),
  left_dataset_id INTEGER NOT NULL REFERENCES datasets(id), right_dataset_id INTEGER NOT NULL REFERENCES datasets(id),
  cadence TEXT NOT NULL CHECK(cadence IN ('daily','weekly')), approval_required INTEGER NOT NULL DEFAULT 1,
- enabled INTEGER NOT NULL DEFAULT 1, next_run_at TEXT NOT NULL, last_run_at TEXT,
+ enabled INTEGER NOT NULL DEFAULT 1, archived INTEGER NOT NULL DEFAULT 0,
+ next_run_at TEXT NOT NULL, last_run_at TEXT,
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS automation_executions (
  id INTEGER PRIMARY KEY, schedule_id INTEGER REFERENCES automation_schedules(id), run_id INTEGER REFERENCES runs(id),
  triggered_by INTEGER REFERENCES users(id), trigger_type TEXT NOT NULL CHECK(trigger_type IN ('scheduled','manual')),
  status TEXT NOT NULL CHECK(status IN ('running','succeeded','failed')),
- message TEXT NOT NULL DEFAULT '', report_file TEXT,
+ message TEXT NOT NULL DEFAULT '', error_code TEXT, report_file TEXT,
  started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, finished_at TEXT
 );
 """
@@ -127,6 +139,15 @@ def init_db():
         run_columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
         if "workflow_template_id" not in run_columns:
             db.execute("ALTER TABLE runs ADD COLUMN workflow_template_id INTEGER REFERENCES workflow_templates(id)")
+        user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
+        if "display_name" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+        schedule_columns = {row["name"] for row in db.execute("PRAGMA table_info(automation_schedules)")}
+        if "archived" not in schedule_columns:
+            db.execute("ALTER TABLE automation_schedules ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+        execution_columns = {row["name"] for row in db.execute("PRAGMA table_info(automation_executions)")}
+        if "error_code" not in execution_columns:
+            db.execute("ALTER TABLE automation_executions ADD COLUMN error_code TEXT")
     try:
         DB_PATH.chmod(0o600)
     except OSError:

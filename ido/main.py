@@ -53,6 +53,7 @@ async def lifespan(app):
     with connect() as db:
         db.execute(f"DELETE FROM sessions WHERE created_at < datetime('now', '-{SESSION_MAX_AGE_HOURS} hours')")
         db.execute("DELETE FROM login_attempts WHERE window_started_at < datetime('now', '-1 day') AND (locked_until IS NULL OR locked_until < datetime('now'))")
+        db.execute("DELETE FROM import_staging WHERE created_at < datetime('now','-1 day')")
         if not db.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
             configured_password = os.getenv("IDO_BOOTSTRAP_ADMIN_PASSWORD")
             initial = configured_password or secrets.token_urlsafe(18)
@@ -108,6 +109,20 @@ class ApprovalDecision(BaseModel):
     decision: str
     comment: str = Field(default="", max_length=1000)
 
+class ImportColumnMapping(BaseModel):
+    source: str = Field(min_length=1, max_length=500)
+    target: str = Field(default="", max_length=500)
+
+class ImportCommit(BaseModel):
+    preview_token: str = Field(min_length=20, max_length=100)
+    columns: list[ImportColumnMapping] = Field(min_length=1, max_length=MAX_IMPORT_COLUMNS)
+
+class ProfileUpdate(BaseModel):
+    display_name: str = Field(default="", max_length=100)
+
+class PreferencesUpdate(BaseModel):
+    preferences: dict = Field(default_factory=dict)
+
 class ResultFeedback(BaseModel):
     verdict: str
     corrected_left_index: int | None = Field(default=None, ge=0)
@@ -136,12 +151,20 @@ class AutomationScheduleInput(BaseModel):
 class AutomationScheduleStatus(BaseModel):
     enabled: bool
 
+class AutomationScheduleUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    workflow_id: int | None = Field(default=None, ge=1)
+    left_dataset_id: int | None = Field(default=None, ge=1)
+    right_dataset_id: int | None = Field(default=None, ge=1)
+    cadence: str | None = None
+    approval_required: bool | None = None
+
 def current_user(authorization: str | None = Header(default=None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Sign in required")
     token_hash = hashlib.sha256(authorization[7:].encode()).hexdigest()
     with connect() as db:
-        row = db.execute(f"SELECT u.id,u.username,u.role,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.created_at>=datetime('now','-{SESSION_MAX_AGE_HOURS} hours')", (token_hash,)).fetchone()
+        row = db.execute(f"SELECT u.id,u.username,u.display_name,u.role,u.active FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.created_at>=datetime('now','-{SESSION_MAX_AGE_HOURS} hours')", (token_hash,)).fetchone()
     if not row or not row["active"]:
         raise HTTPException(401, "Session expired or user disabled")
     return dict(row)
@@ -236,6 +259,47 @@ def logout(user=Depends(current_user), authorization: str = Header()):
 @app.get("/api/me")
 def me(user=Depends(current_user)):
     return user
+
+@app.patch("/api/me/profile")
+def update_profile(payload: ProfileUpdate, user=Depends(current_user)):
+    display_name = payload.display_name.strip()
+    with connect() as db:
+        db.execute("UPDATE users SET display_name=? WHERE id=?", (display_name, user["id"]))
+        audit(db, user["id"], "update_profile", "user", user["id"], {"display_name": display_name})
+    return {"display_name": display_name}
+
+DEFAULT_WORKSPACE_PREFERENCES = {"timezone": "Africa/Johannesburg", "currency": "ZAR", "date_format": "yyyy-mm-dd", "default_report_days": 30, "confirm_deletes": True}
+
+@app.get("/api/me/preferences")
+def get_preferences(user=Depends(current_user)):
+    with connect() as db:
+        row = db.execute("SELECT preferences_json FROM user_preferences WHERE user_id=?", (user["id"],)).fetchone()
+    saved = json.loads(row["preferences_json"]) if row else {}
+    return {**DEFAULT_WORKSPACE_PREFERENCES, **saved}
+
+@app.patch("/api/me/preferences")
+def update_preferences(payload: PreferencesUpdate, user=Depends(current_user)):
+    allowed = set(DEFAULT_WORKSPACE_PREFERENCES)
+    if set(payload.preferences) - allowed:
+        raise HTTPException(400, "Unsupported workspace preference")
+    with connect() as db:
+        current = db.execute("SELECT preferences_json FROM user_preferences WHERE user_id=?", (user["id"],)).fetchone()
+    existing = json.loads(current["preferences_json"]) if current else {}
+    merged = {**DEFAULT_WORKSPACE_PREFERENCES, **existing, **payload.preferences}
+    if merged["timezone"] not in {"Africa/Johannesburg", "UTC", "Europe/London", "America/New_York"}:
+        raise HTTPException(400, "Choose a supported timezone")
+    if merged["currency"] not in {"ZAR", "USD", "GBP", "EUR"}:
+        raise HTTPException(400, "Choose a supported reporting currency")
+    if merged["date_format"] not in {"yyyy-mm-dd", "dd/mm/yyyy", "mm/dd/yyyy"}:
+        raise HTTPException(400, "Choose a supported date format")
+    if type(merged["default_report_days"]) is not int or merged["default_report_days"] not in {7, 30, 90, 365}:
+        raise HTTPException(400, "Default report period must be 7, 30, 90, or 365 days")
+    if type(merged["confirm_deletes"]) is not bool:
+        raise HTTPException(400, "Confirm-delete preference must be true or false")
+    with connect() as db:
+        db.execute("INSERT INTO user_preferences(user_id,preferences_json) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET preferences_json=excluded.preferences_json,updated_at=CURRENT_TIMESTAMP", (user["id"], json.dumps(merged)))
+        audit(db, user["id"], "update_workspace_preferences", "user", user["id"], merged)
+    return merged
 
 @app.get("/api/users")
 def users(user=Depends(require("admin"))):
@@ -336,6 +400,109 @@ async def upload_dataset(name: str, file: UploadFile = File(...), user=Depends(r
                          (name, file.filename, user["id"], json.dumps(columns), json.dumps(rows), len(rows)))
         audit(db, user["id"], "import_dataset", "dataset", cur.lastrowid, {"rows": len(rows), "source_name": file.filename})
         return {"id": cur.lastrowid, "name": name, "source_name": file.filename, "columns": columns, "row_count": len(rows)}
+
+@app.post("/api/imports/preview")
+async def preview_import(name: str, file: UploadFile = File(...), user=Depends(require("analyst"))):
+    if not file.filename or not file.filename.lower().endswith((".csv", ".xlsx")):
+        raise HTTPException(400, "Upload a CSV or XLSX file")
+    name = name.strip()
+    if not name or len(name) > 120:
+        raise HTTPException(400, "Dataset name must be between 1 and 120 characters")
+    raw = await file.read(MAX_UPLOAD_BYTES + 1)
+    await file.close()
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "File exceeds the 25 MB local upload limit")
+    invalid_rows, rows = [], []
+    try:
+        if file.filename.lower().endswith(".xlsx"):
+            from openpyxl import load_workbook
+            validate_xlsx_archive(raw)
+            workbook = load_workbook(io.BytesIO(raw), read_only=True, data_only=True, keep_links=False)
+            try:
+                sheet = workbook.active
+                if sheet.max_column and sheet.max_column > MAX_IMPORT_COLUMNS:
+                    raise ValueError("Spreadsheet has more than 500 columns")
+                if sheet.max_row and sheet.max_row > MAX_IMPORT_ROWS + 1:
+                    raise ValueError("Spreadsheet has more than 100,000 data rows")
+                iterator = sheet.iter_rows(values_only=True)
+                columns = [str(v).strip() if v is not None else "" for v in next(iterator, ())]
+                for line, values in enumerate(iterator, start=2):
+                    if line > MAX_IMPORT_ROWS + 1:
+                        raise ValueError("Spreadsheet has more than 100,000 data rows")
+                    if len(values) > len(columns):
+                        invalid_rows.append({"row": line, "reason": f"Row has {len(values)-len(columns)} extra cell(s)"})
+                        continue
+                    vals = [v.isoformat() if isinstance(v, (date, datetime)) else v for v in values]
+                    if any(len(str(v)) > MAX_IMPORT_CELL_CHARS for v in vals if v is not None):
+                        invalid_rows.append({"row": line, "reason": "Cell exceeds 100,000 characters"})
+                        continue
+                    if not any(str(v).strip() for v in vals if v is not None):
+                        invalid_rows.append({"row": line, "reason": "Blank row"})
+                        continue
+                    rows.append({col: (str(vals[i]) if i < len(vals) and vals[i] is not None else "") for i, col in enumerate(columns)})
+            finally:
+                workbook.close()
+        else:
+            csv.field_size_limit(MAX_IMPORT_CELL_CHARS)
+            reader = csv.reader(io.StringIO(raw.decode("utf-8-sig")))
+            columns = [str(c).strip() if c is not None else "" for c in next(reader, [])]
+            for line, values in enumerate(reader, start=2):
+                if line > MAX_IMPORT_ROWS + 1:
+                    raise ValueError("CSV has more than 100,000 data rows")
+                if len(values) != len(columns):
+                    invalid_rows.append({"row": line, "reason": f"Expected {len(columns)} cells, found {len(values)}"})
+                    continue
+                if any(len(v) > MAX_IMPORT_CELL_CHARS for v in values):
+                    invalid_rows.append({"row": line, "reason": "Cell exceeds 100,000 characters"})
+                    continue
+                if not any(v.strip() for v in values):
+                    invalid_rows.append({"row": line, "reason": "Blank row"})
+                    continue
+                rows.append(dict(zip(columns, values)))
+        if not columns or not any(rows):
+            raise ValueError("File must contain headers and at least one valid data row")
+        if any(not c for c in columns) or len({c.casefold() for c in columns}) != len(columns):
+            raise ValueError("Column headers must be non-empty and unique (ignoring letter case)")
+        if sum(len(r) for r in rows) > MAX_IMPORT_CELLS:
+            raise ValueError("File exceeds the 2,000,000 cell processing limit")
+    except Exception as exc:
+        raise HTTPException(400, str(exc) if isinstance(exc, ValueError) else "Unable to read CSV or XLSX file")
+    token = secrets.token_urlsafe(36)
+    with connect() as db:
+        db.execute("INSERT INTO import_staging(token,owner_id,name,source_name,columns_json,rows_json,invalid_rows_json,invalid_count) VALUES(?,?,?,?,?,?,?,?)",
+                   (token, user["id"], name, file.filename, json.dumps(columns), json.dumps(rows), json.dumps(invalid_rows[:200]), len(invalid_rows)))
+    return {"preview_token": token, "name": name, "source_name": file.filename, "columns": columns,
+            "sample_rows": rows[:5], "valid_row_count": len(rows), "invalid_count": len(invalid_rows), "invalid_rows": invalid_rows[:50]}
+
+@app.post("/api/imports/commit")
+def commit_import(payload: ImportCommit, user=Depends(require("analyst"))):
+    with connect() as db:
+        staged = db.execute("SELECT * FROM import_staging WHERE token=? AND owner_id=? AND created_at>=datetime('now','-1 day')",
+                            (payload.preview_token, user["id"])).fetchone()
+        if not staged:
+            raise HTTPException(404, "Import preview expired or not found; preview the file again")
+        source_columns, source_rows = json.loads(staged["columns_json"]), json.loads(staged["rows_json"])
+        requested = {}
+        for mapping in payload.columns:
+            if mapping.source not in source_columns or mapping.source in requested:
+                raise HTTPException(400, "Column mapping contains an unknown or repeated source field")
+            target = mapping.target.strip()
+            if target:
+                requested[mapping.source] = target
+        targets = list(requested.values())
+        if not targets:
+            raise HTTPException(400, "Keep and name at least one column")
+        if len({target.casefold() for target in targets}) != len(targets):
+            raise HTTPException(400, "Mapped column names must be unique")
+        prepared = [{requested[source]: row.get(source, "") for source in requested} for row in source_rows]
+        cur = db.execute("INSERT INTO datasets(name,source_name,owner_id,columns_json,rows_json,row_count) VALUES(?,?,?,?,?,?)",
+                         (staged["name"], staged["source_name"], user["id"], json.dumps(targets), json.dumps(prepared), len(prepared)))
+        dataset_id = cur.lastrowid
+        audit(db, user["id"], "import_dataset", "dataset", dataset_id,
+              {"rows": len(prepared), "invalid_rows_skipped": staged["invalid_count"], "source_name": staged["source_name"], "mapped_columns": len(targets)})
+        db.execute("DELETE FROM import_staging WHERE token=?", (payload.preview_token,))
+    return {"id": dataset_id, "name": staged["name"], "source_name": staged["source_name"], "columns": targets,
+            "row_count": len(prepared), "invalid_rows_skipped": staged["invalid_count"]}
 
 @app.get("/api/datasets")
 def datasets(user=Depends(current_user)):
@@ -489,12 +656,13 @@ def run_automation_schedule(schedule_id, trigger_type="scheduled", triggered_by=
         return {"id": execution_id, "run_id": run_id, "status": "succeeded", "report_file": report_file}
     except Exception as exc:
         message = str(exc)[:1000] or "Automation failed"
+        error_code = "AUTOMATION_VALIDATION" if isinstance(exc, ValueError) else "AUTOMATION_ERROR"
         with connect() as db:
-            db.execute("UPDATE automation_executions SET run_id=?,status='failed',message=?,finished_at=CURRENT_TIMESTAMP WHERE id=?",
-                       (run_id, message, execution_id))
+            db.execute("UPDATE automation_executions SET run_id=?,status='failed',message=?,error_code=?,finished_at=CURRENT_TIMESTAMP WHERE id=?",
+                       (run_id, message, error_code, execution_id))
             audit(db, triggered_by or owner_id, "automation_failed", "automation_execution", execution_id,
                   {"schedule_id": schedule_id, "message": message})
-        return {"id": execution_id, "run_id": run_id, "status": "failed", "message": message}
+        return {"id": execution_id, "run_id": run_id, "status": "failed", "error_code": error_code, "message": message}
 
 def process_due_automation_schedules():
     now = automation_time()
@@ -517,19 +685,24 @@ def automation_schedules(user=Depends(current_user)):
         rows = db.execute("""SELECT s.id,s.owner_id,u.username owner_name,s.name,s.workflow_id,w.name workflow_name,
           s.left_dataset_id,d1.name left_dataset,s.right_dataset_id,d2.name right_dataset,s.cadence,
           s.approval_required,s.enabled,s.next_run_at,s.last_run_at,s.created_at,s.updated_at,
-          (SELECT status FROM automation_executions e WHERE e.schedule_id=s.id ORDER BY e.id DESC LIMIT 1) last_status
+          (SELECT status FROM automation_executions e WHERE e.schedule_id=s.id ORDER BY e.id DESC LIMIT 1) last_status,
+          (SELECT message FROM automation_executions e WHERE e.schedule_id=s.id ORDER BY e.id DESC LIMIT 1) last_message,
+          (SELECT COUNT(*) FROM automation_executions e WHERE e.schedule_id=s.id) execution_count
           FROM automation_schedules s JOIN users u ON u.id=s.owner_id JOIN workflow_templates w ON w.id=s.workflow_id
-          JOIN datasets d1 ON d1.id=s.left_dataset_id JOIN datasets d2 ON d2.id=s.right_dataset_id ORDER BY s.id DESC""").fetchall()
+          JOIN datasets d1 ON d1.id=s.left_dataset_id JOIN datasets d2 ON d2.id=s.right_dataset_id WHERE s.archived=0 ORDER BY s.id DESC""").fetchall()
     return [dict(row) for row in rows]
 
 @app.get("/api/automation/executions")
 def automation_executions(user=Depends(current_user)):
     with connect() as db:
         rows = db.execute("""SELECT e.id,e.schedule_id,s.name schedule_name,e.run_id,e.trigger_type,e.status,e.message,
+          e.triggered_by,COALESCE(NULLIF(u.display_name,''),u.username,'System') triggered_by_name,
+          s.owner_id schedule_owner_id,e.error_code,
           e.started_at,e.finished_at,CASE WHEN e.report_file IS NULL THEN 0 ELSE 1 END has_report,
           r.name run_name,(SELECT COUNT(*) FROM results x WHERE x.run_id=e.run_id AND x.status='matched') matched,
           (SELECT COUNT(*) FROM results x WHERE x.run_id=e.run_id AND x.status!='matched') exceptions
           FROM automation_executions e LEFT JOIN automation_schedules s ON s.id=e.schedule_id
+          LEFT JOIN users u ON u.id=e.triggered_by
           LEFT JOIN runs r ON r.id=e.run_id ORDER BY e.id DESC LIMIT 100""").fetchall()
     return [dict(row) for row in rows]
 
@@ -563,10 +736,60 @@ def create_automation_schedule(payload: AutomationScheduleInput, user=Depends(re
               {"cadence": payload.cadence, "workflow_id": payload.workflow_id, "approval_required": payload.approval_required})
         return {"id": cur.lastrowid, "name": name, "next_run_at": next_run, "enabled": True}
 
+@app.patch("/api/automation/schedules/{schedule_id}")
+def update_automation_schedule(schedule_id: int, payload: AutomationScheduleUpdate, user=Depends(require("analyst"))):
+    with connect() as db:
+        schedule = db.execute("SELECT * FROM automation_schedules WHERE id=? AND archived=0", (schedule_id,)).fetchone()
+        if not schedule:
+            raise HTTPException(404, "Automation schedule not found")
+        if schedule["owner_id"] != user["id"] and user["role"] != "admin":
+            raise HTTPException(403, "Only the schedule owner or an administrator can edit it")
+        name = (payload.name if payload.name is not None else schedule["name"]).strip()
+        workflow_id = payload.workflow_id if payload.workflow_id is not None else schedule["workflow_id"]
+        left_id = payload.left_dataset_id if payload.left_dataset_id is not None else schedule["left_dataset_id"]
+        right_id = payload.right_dataset_id if payload.right_dataset_id is not None else schedule["right_dataset_id"]
+        cadence = payload.cadence if payload.cadence is not None else schedule["cadence"]
+        approval_required = int(payload.approval_required if payload.approval_required is not None else schedule["approval_required"])
+        if not name or cadence not in {"daily", "weekly"} or left_id == right_id:
+            raise HTTPException(400, "Provide a name, valid frequency, and two different datasets")
+        workflow = db.execute("SELECT config_json FROM workflow_templates WHERE id=?", (workflow_id,)).fetchone()
+        left = db.execute("SELECT columns_json FROM datasets WHERE id=?", (left_id,)).fetchone()
+        right = db.execute("SELECT columns_json FROM datasets WHERE id=?", (right_id,)).fetchone()
+        if not workflow or not left or not right:
+            raise HTTPException(404, "Workflow or dataset not found")
+        config = json.loads(workflow["config_json"])
+        left_columns, right_columns = json.loads(left["columns_json"]), json.loads(right["columns_json"])
+        if not config.get("key_mappings") or any(m.get("left") not in left_columns or m.get("right") not in right_columns for m in config.get("key_mappings", [])):
+            raise HTTPException(400, "The selected workflow fields do not match the chosen datasets")
+        amount = config.get("amount_mapping")
+        if amount and (amount.get("left") not in left_columns or amount.get("right") not in right_columns):
+            raise HTTPException(400, "The selected workflow amount fields do not match the chosen datasets")
+        date_window = config.get("date_window") or {}
+        if date_window and (date_window.get("left") not in left_columns or date_window.get("right") not in right_columns):
+            raise HTTPException(400, "The selected workflow date fields do not match the chosen datasets")
+        next_run = next_automation_time(cadence) if schedule["enabled"] else schedule["next_run_at"]
+        db.execute("UPDATE automation_schedules SET name=?,workflow_id=?,left_dataset_id=?,right_dataset_id=?,cadence=?,approval_required=?,next_run_at=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                   (name, workflow_id, left_id, right_id, cadence, approval_required, next_run, schedule_id))
+        audit(db, user["id"], "update_automation_schedule", "automation_schedule", schedule_id,
+              {"name": name, "workflow_id": workflow_id, "left_dataset_id": left_id, "right_dataset_id": right_id, "cadence": cadence, "approval_required": bool(approval_required)})
+    return {"id": schedule_id, "name": name, "next_run_at": next_run}
+
+@app.delete("/api/automation/schedules/{schedule_id}")
+def delete_automation_schedule(schedule_id: int, user=Depends(require("analyst"))):
+    with connect() as db:
+        schedule = db.execute("SELECT owner_id,name FROM automation_schedules WHERE id=? AND archived=0", (schedule_id,)).fetchone()
+        if not schedule:
+            raise HTTPException(404, "Automation schedule not found")
+        if schedule["owner_id"] != user["id"] and user["role"] != "admin":
+            raise HTTPException(403, "Only the schedule owner or an administrator can delete it")
+        db.execute("UPDATE automation_schedules SET enabled=0,archived=1,updated_at=CURRENT_TIMESTAMP WHERE id=?", (schedule_id,))
+        audit(db, user["id"], "archive_automation_schedule", "automation_schedule", schedule_id, {"name": schedule["name"], "history_retained": True})
+    return {"id": schedule_id, "archived": True}
+
 @app.post("/api/automation/schedules/{schedule_id}/run")
 def run_automation_now(schedule_id: int, user=Depends(require("analyst"))):
     with connect() as db:
-        schedule = db.execute("SELECT owner_id FROM automation_schedules WHERE id=?", (schedule_id,)).fetchone()
+        schedule = db.execute("SELECT owner_id FROM automation_schedules WHERE id=? AND archived=0", (schedule_id,)).fetchone()
     if not schedule:
         raise HTTPException(404, "Automation schedule not found")
     if schedule["owner_id"] != user["id"] and user["role"] != "admin":
@@ -576,7 +799,7 @@ def run_automation_now(schedule_id: int, user=Depends(require("analyst"))):
 @app.patch("/api/automation/schedules/{schedule_id}/status")
 def set_automation_status(schedule_id: int, payload: AutomationScheduleStatus, user=Depends(require("analyst"))):
     with connect() as db:
-        schedule = db.execute("SELECT owner_id,cadence FROM automation_schedules WHERE id=?", (schedule_id,)).fetchone()
+        schedule = db.execute("SELECT owner_id,cadence FROM automation_schedules WHERE id=? AND archived=0", (schedule_id,)).fetchone()
         if not schedule:
             raise HTTPException(404, "Automation schedule not found")
         if schedule["owner_id"] != user["id"] and user["role"] != "admin":
@@ -965,6 +1188,8 @@ def request_approval(run_id: int, user=Depends(require("analyst"))):
 def decide_approval(run_id: int, payload: ApprovalDecision, user=Depends(require("approver"))):
     if payload.decision not in {"approved", "rejected"}:
         raise HTTPException(400, "Decision must be approved or rejected")
+    if payload.decision == "rejected" and not payload.comment.strip():
+        raise HTTPException(400, "A comment explaining a rejection is required")
     with connect() as db:
         approval = db.execute("SELECT * FROM approvals WHERE run_id=?", (run_id,)).fetchone()
         if not approval or approval["status"] != "pending":
@@ -975,6 +1200,15 @@ def decide_approval(run_id: int, payload: ApprovalDecision, user=Depends(require
         db.execute("UPDATE runs SET status=? WHERE id=?", (payload.decision, run_id))
         audit(db, user["id"], payload.decision + "_run", "run", run_id, {"comment": payload.comment})
     return {"run_id": run_id, "approval_status": payload.decision}
+
+@app.get("/api/approvals")
+def approval_history(user=Depends(current_user)):
+    with connect() as db:
+        rows = db.execute("""SELECT a.run_id,a.status,a.comment,a.requested_at,a.decided_at,
+          req.username requested_by,dec.username decided_by,r.name run_name,r.created_by
+          FROM approvals a JOIN runs r ON r.id=a.run_id JOIN users req ON req.id=a.requested_by
+          LEFT JOIN users dec ON dec.id=a.decided_by ORDER BY COALESCE(a.decided_at,a.requested_at) DESC,a.run_id DESC LIMIT 200""").fetchall()
+    return [dict(row) for row in rows]
 
 @app.get("/api/audit")
 def audit_events(user=Depends(require("approver"))):
