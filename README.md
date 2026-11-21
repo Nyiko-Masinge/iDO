@@ -21,6 +21,18 @@ uvicorn ido.main:app --reload
 
 Open http://127.0.0.1:8000. On first start, iDO creates the local database and an `admin` user. The bootstrap password is read only when that account does not already exist; if the environment variable is unset, a generated password is printed in the server console. Database and uploaded files default to `./data` and can be relocated with `IDO_DATA_DIR`.
 
+## Git hooks for contributors
+
+After cloning, enable the repository's local hooks once:
+
+```powershell
+python scripts/install_git_hooks.py
+```
+
+The pre-commit hook checks the staged file contents for Python syntax errors, inline JavaScript syntax errors (when Node.js is installed), unresolved merge-conflict markers, common hard-coded credential patterns, and local `.env`, database, or `data/` files. The pre-push hook applies those checks to commits being sent to the remote, including each outgoing commit's contents. The checks use Python's standard library; Node.js is optional and is used only for JavaScript syntax checks. Hooks are local to each checkout, so each contributor runs the setup command after cloning.
+
+If a hook blocks an operation, fix the reported problem, stage the correction, and retry. For a genuine emergency only, a one-time bypass is possible with `git -c core.hooksPath=/dev/null commit ...` or `git -c core.hooksPath=/dev/null push ...`; resolve the underlying issue immediately afterward. Hooks are a safety net and do not replace code review or security scanning.
+
 Keep the server bound to localhost for this local build. Do not expose it to a LAN or the public internet: production use still needs HTTPS, managed secrets, MFA, deployment-level request limits, monitored backups, retention controls, and an independent security review.
 
 If you lose a local user's password, stop the server and run `python -m ido.reset_admin` from this project directory. It prompts securely for the new password, invalidates that user's sessions, and keeps datasets and workflows.
