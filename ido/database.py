@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE TABLE IF NOT EXISTS results (
  id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
  left_index INTEGER, right_index INTEGER, status TEXT NOT NULL, score REAL NOT NULL,
+ exception_category TEXT,
  explanation TEXT NOT NULL, left_json TEXT, right_json TEXT
 );
 CREATE TABLE IF NOT EXISTS approvals (
@@ -139,6 +140,9 @@ def init_db():
         run_columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
         if "workflow_template_id" not in run_columns:
             db.execute("ALTER TABLE runs ADD COLUMN workflow_template_id INTEGER REFERENCES workflow_templates(id)")
+        result_columns = {row["name"] for row in db.execute("PRAGMA table_info(results)")}
+        if "exception_category" not in result_columns:
+            db.execute("ALTER TABLE results ADD COLUMN exception_category TEXT")
         user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
         if "display_name" not in user_columns:
             db.execute("ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
