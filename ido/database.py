@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS users (
  id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
  display_name TEXT NOT NULL DEFAULT '',
  role TEXT NOT NULL CHECK(role IN ('admin','approver','analyst','viewer')),
- active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+ active INTEGER NOT NULL DEFAULT 1, password_reset_required INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS sessions (
  token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -137,6 +138,9 @@ def init_db():
         db.executescript(SCHEMA)
         db.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_created ON sessions(user_id, created_at)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_attempts_window ON login_attempts(window_started_at)")
+        user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
+        if "password_reset_required" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN password_reset_required INTEGER NOT NULL DEFAULT 0")
         run_columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
         if "workflow_template_id" not in run_columns:
             db.execute("ALTER TABLE runs ADD COLUMN workflow_template_id INTEGER REFERENCES workflow_templates(id)")

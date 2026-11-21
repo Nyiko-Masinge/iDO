@@ -51,6 +51,8 @@ Reviewers can confirm matches, flag false matches, confirm exceptions, and recor
 - `analyst`: import, configure, run, and review reconciliations; request approval.
 - `viewer`: read-only access.
 
+Administrators can activate/deactivate accounts, update roles, issue one-time temporary passwords, and revoke sessions from Team & access. New accounts and password resets require a password change before the rest of the application is available. Password changes revoke all sessions for that account; when an admin revokes their own other sessions, the current session is preserved. iDO prevents demoting or deactivating the last active administrator.
+
 ## Structure
 
 - `ido/main.py`: API, authentication, authorization, imports, workflows, analytics, and exports.
